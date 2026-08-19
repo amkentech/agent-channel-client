@@ -1,0 +1,7 @@
+bin/
+hooks/
+lib/
+scripts/
+README.md
+node_modules/
+*.tgz

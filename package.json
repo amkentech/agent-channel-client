@@ -1,0 +1,33 @@
+{
+  "name": "@amkentech/agent-channel",
+  "version": "0.5.2",
+  "description": "Send your Claude Code or Codex session, or a file, to another person in one line: encrypted read-only links (no account), or into a teammate's inbox via hooks + a remote MCP server. The server is a separate, private service.",
+  "type": "module",
+  "bin": {
+    "agent-channel": "bin/agent-channel.mjs"
+  },
+  "files": [
+    "bin",
+    "hooks",
+    "lib",
+    "scripts",
+    "db",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "mcp",
+    "agents",
+    "claude-code",
+    "codex",
+    "collaboration"
+  ],
+  "homepage": "https://agent-channel-production.up.railway.app/",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "ws": "^8.21.3"
+  }
+}

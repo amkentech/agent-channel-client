@@ -1,0 +1,47 @@
+name: Publish to npm
+
+# Fires on a version tag pushed by scripts/release-client.mjs in the private server repo.
+#
+# There is no npm token anywhere in this repository or in its secrets. Publishing authenticates with GitHub's OIDC identity
+# through npm trusted publishing, and --provenance attaches a signed attestation that ties the tarball on npm to this commit,
+# this workflow and this runner. Anyone can check it: `npm view @amkentech/agent-channel` shows the provenance link.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required for both trusted publishing and provenance
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: npm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: npm 11+ (trusted publishing needs it)
+        run: npm install -g npm@latest
+
+      - name: The package parses
+        run: |
+          for f in $(git ls-files '*.mjs' '*.js'); do node --check "$f" || exit 1; done
+
+      - name: Tag matches package.json
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          test "$tag" = "$pkg" || { echo "::error::tag $tag != package.json $pkg"; exit 1; }
+
+      - name: No install scripts (this runs on other people's machines)
+        run: |
+          node -e "const p=require('./package.json');const s=p.scripts||{};for(const k of ['preinstall','install','postinstall','prepare'])if(s[k]){console.error('::error::'+k+' script present: '+s[k]);process.exit(1)}"
+
+      - name: Publish with provenance
+        run: npm publish --access public --provenance
