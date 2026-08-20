@@ -44,19 +44,19 @@ jobs:
         run: |
           node -e "const p=require('./package.json');const s=p.scripts||{};for(const k of ['preinstall','install','postinstall','prepare'])if(s[k]){console.error('::error::'+k+' script present: '+s[k]);process.exit(1)}"
 
-      # A package that installs but contains nothing is worse than a failed publish, and .gitignore mistakes cause exactly that.
+      # A package that installs but contains nothing is worse than a failed publish, and .gitignore mistakes cause exactly
+      # that. Build the real tarball and read what is inside it: no dependence on the shape of any npm --json output.
       - name: The tarball actually contains the client
         run: |
-          npm pack --dry-run --json > /tmp/pack.json
-          node -e "
-            const p = require('/tmp/pack.json')[0];
-            const names = p.files.map(f => f.path);
-            const need = ['package.json','README.md','bin/agent-channel.mjs','hooks/inbox.mjs','lib/paths.mjs','scripts/setup.mjs','scripts/share.mjs'];
-            const missing = need.filter(n => !names.includes(n));
-            if (missing.length) { console.error('::error::tarball is missing ' + missing.join(', ')); process.exit(1); }
-            if (p.entryCount < 20) { console.error('::error::tarball has only ' + p.entryCount + ' files'); process.exit(1); }
-            console.log('tarball ok: ' + p.entryCount + ' files, ' + Math.round(p.unpackedSize/1024) + ' kB unpacked');
-          "
+          tarball=$(npm pack --silent | tail -1)
+          echo "packed $tarball"
+          tar -tzf "$tarball" | sed 's|^package/||' | sort > /tmp/files.txt
+          echo "$(wc -l < /tmp/files.txt) files:"; cat /tmp/files.txt
+          for f in package.json README.md bin/agent-channel.mjs hooks/inbox.mjs lib/paths.mjs scripts/setup.mjs scripts/share.mjs; do
+            grep -qx "$f" /tmp/files.txt || { echo "::error::tarball is missing $f"; exit 1; }
+          done
+          test "$(wc -l < /tmp/files.txt)" -ge 20 || { echo "::error::tarball has fewer than 20 files"; exit 1; }
+          rm -f "$tarball"
 
       - name: Publish with provenance
         run: npm publish --access public --provenance
