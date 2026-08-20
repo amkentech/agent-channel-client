@@ -29,5 +29,12 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",
     "ws": "^8.21.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amkentech/agent-channel-client.git"
+  },
+  "bugs": {
+    "url": "https://github.com/amkentech/agent-channel-client/issues"
   }
 }
