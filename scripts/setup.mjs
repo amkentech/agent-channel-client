@@ -1,0 +1,234 @@
+#!/usr/bin/env node
+// One-command onboarding and health check for a person joining Agent Channel.
+//
+//   node scripts/setup.mjs join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|both] [--email you@x.com]
+//        -> creates your identity + one agent token per runtime, connected to whoever invited you, then wires everything below
+//   node scripts/setup.mjs wire [--runtime claude|codex] [--token ac_...]
+//        -> MCP server in the client, hooks (type-to-send, waiting banner, status), token storage, listener at logon, listener now
+//   node scripts/setup.mjs doctor
+//        -> checks every piece and says exactly what is missing
+//
+// Nothing here needs the admin key. Runtime-specific behavior lives in lib/adapters.mjs.
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync, readdirSync } from "node:fs";
+import { join, resolve, dirname } from "node:path";
+import { homedir, platform } from "node:os";
+import { fileURLToPath } from "node:url";
+import { execFileSync, spawn } from "node:child_process";
+import { ADAPTERS, adapterFor, mergeHooks, which } from "../lib/adapters.mjs";
+import { readTok as readTokStore, saveTok as saveTokStore, tokFileHome, CLIENT_HOME, IN_NPX_CACHE, HOME_STORE } from "../lib/paths.mjs";
+
+let REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+// Running from an npx cache (npx @amkentech/agent-channel join ...)? That folder can vanish, and hooks/listener need a stable path:
+// copy this package to ~/.agentchan/client and run from there. A git checkout or a global install stays where it is.
+if (IN_NPX_CACHE && !process.env.AGENTCHAN_NO_SELF_INSTALL) {
+  const { cpSync } = await import("node:fs");
+  cpSync(REPO, CLIENT_HOME, { recursive: true, force: true, filter: (src) => !/[\\/](\.git|\.tok\.[^\\/]+\.json|\.env[^\\/]*)$/.test(src) });
+  // the listener needs the package's own deps (ws, MCP sdk); hooks need none. Install them once in the persistent copy.
+  try { const { execFileSync: x } = await import("node:child_process"); x(platform() === "win32" ? "npm.cmd" : "npm", ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--silent"], { cwd: CLIENT_HOME, stdio: "ignore", shell: platform() === "win32" }); }
+  catch { console.log("  note: could not npm install in " + CLIENT_HOME + "; run it there by hand before starting the listener"); }
+  console.log("  installed client to " + CLIENT_HOME + " (hooks and the listener run from there; re-run join/wire from any npx to update)");
+  REPO = CLIENT_HOME;
+}
+const BASE = (process.env.AGENTCHAN_URL || "https://agent-channel-production.up.railway.app").replace(/\/mcp$/, "");
+const args = process.argv.slice(2);
+const cmd = args[0];
+const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
+const H = homedir();
+const WIN = platform() === "win32";
+const say = (s) => console.log(s);
+const ok = (s) => say("  ok   " + s);
+const bad = (s) => say("  MISSING  " + s);
+const warn = (s) => say("  note " + s);
+
+const tokFile = (key) => tokFileHome(key);            // tokens live in ~/.agentchan, not next to the code
+const readTok = (key) => readTokStore(key);
+const saveTok = (key, obj) => saveTokStore(key, obj);
+const tokenFor = (ad) => process.env[ad.tokenEnv] || readTok(ad.key)?.token || (ad.key === "claude-desktop" ? readTok("claude")?.token : null) || null;
+
+async function api(path, body, token, retry = 1) {
+  try { return await api1(path, body, token); }
+  catch (e) { if (retry > 0 && /fetch failed/i.test(e.message)) return api(path, body, token, retry - 1); throw e; } // keep-alive socket reset after a long sync exec
+}
+async function api1(path, body, token) {
+  const r = await fetch(BASE + path, { method: body ? "POST" : "GET", headers: { "content-type": "application/json", ...(token ? { authorization: "Bearer " + token } : {}) }, body: body ? JSON.stringify(body) : undefined, signal: AbortSignal.timeout(15000) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(path + " -> " + r.status + " " + (j.error || ""));
+  return j;
+}
+
+function runtimesWanted() {
+  const r = (opt("--runtime", "") || "").toLowerCase();
+  if (r === "both") return [ADAPTERS.claude, ADAPTERS.codex];
+  if (r === "all") return [ADAPTERS.claude, ADAPTERS.codex, ADAPTERS["claude-desktop"], ADAPTERS.cursor, ADAPTERS.gemini, ADAPTERS.windsurf].filter((a) => a.detect());
+  if (r === "desktop" || r === "claude-desktop") return [ADAPTERS["claude-desktop"]];
+  if (r) return [adapterFor(r)];
+  const found = [ADAPTERS.claude, ADAPTERS.codex].filter((a) => a.detect());
+  return found.length ? found : [ADAPTERS.claude];
+}
+
+// ---------------- join ----------------
+async function join_() {
+  const [code, handle, display_name] = args.slice(1).filter((x, i, arr) => !x.startsWith("--") && arr[i - 1] !== "--runtime" && arr[i - 1] !== "--email");
+  if (!code || !handle || !display_name) { say('usage: setup.mjs join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|both] [--email you@x.com]'); process.exit(1); }
+  const ads = runtimesWanted();
+  const first = ads[0];
+  say("Joining Agent Channel as @" + handle.replace(/^@/, "") + " (" + ads.map((a) => a.label).join(" + ") + ")...");
+  const j = await api("/join", { code, handle, display_name, runtime: first.runtime, email: opt("--email"), agent_name: first.key });
+  saveTok(first.key, { handle: j.handle.replace(/^@/, ""), agent_id: j.agent.id, runtime: first.runtime, token: j.token, base: BASE });
+  say("Welcome, " + j.handle + ". Connected to " + j.connected_to + ". Token for " + first.label + " saved to " + tokFile(first.key) + " (gitignored; shown nowhere else).");
+  for (const ad of ads.slice(1)) {
+    const a2 = await api("/agents", { name: ad.key, runtime: ad.runtime }, j.token);
+    saveTok(ad.key, { handle: j.handle.replace(/^@/, ""), agent_id: a2.id, runtime: ad.runtime, token: a2.token, base: BASE });
+    say("Second agent for " + ad.label + " minted and saved to " + tokFile(ad.key) + ".");
+  }
+  if (!args.includes("--no-wire")) for (const ad of ads) await wire(ad, tokenFor(ad));
+  say("");
+  say("Done. Open " + ads.map((a) => a.label).join(" or ") + " and type:   @" + j.connected_to.replace(/^@/, "") + " hi, I'm in.");
+  say("Then run  node scripts/setup.mjs doctor  any time.");
+}
+
+// ---------------- wire ----------------
+async function wire(ad, token) {
+  if (!token) {
+    // no token for this runtime yet, but the person is already here under another: mint an agent for this runtime
+    const seed = readTok("claude")?.token || readTok("codex")?.token || process.env.AGENTCHAN_TOKEN || null;
+    if (seed && !args.includes("--dry-run")) {
+      try { const a2 = await api("/agents", { name: ad.key, runtime: ad.runtime }, seed); const h = readTok("claude")?.handle || readTok("codex")?.handle || null; saveTok(ad.key, { handle: h, agent_id: a2.id, runtime: ad.runtime, token: a2.token, base: BASE }); token = a2.token; ok(ad.label + ": minted its own agent (" + ad.runtime + ") for your handle"); }
+      catch (e) { bad(ad.label + ": could not mint an agent (" + e.message.slice(0, 120) + ")"); return; }
+    } else if (seed) { token = seed; }
+    else { bad(ad.label + ": no token. Pass --token or join first."); return; }
+  }
+  say("");
+  say("Wiring " + ad.label + ":");
+  if (args.includes("--dry-run")) {
+    const m = ad.mcpWire({ url: BASE, token: token ? token.slice(0, 6) + "..." : token }); const hw = ad.hooksWire({ repo: REPO });
+    say("  would: save token to " + tokFile(ad.key) + (WIN && ["claude", "codex"].includes(ad.key) ? " and setx " + ad.tokenEnv : ""));
+    say("  would: " + m.command.split(String.fromCharCode(10))[0]);
+    if (ad.hooksFile) say("  would: merge hooks into " + ad.hooksFile + " (" + Object.keys(hw.hooks || {}).join(", ") + ")"); else say("  note: " + (hw.note || "no hooks for this runtime"));
+    if (ad.key !== "claude-desktop") say("  would: install the listener to start at login (" + (WIN ? "Startup folder + run_listen_" + ad.key + ".cmd" : platform() === "darwin" ? "LaunchAgent com.agentchannel.listen." + ad.key : "systemd --user unit") + ") and start it now");
+    return;
+  }
+  // 1. token where the hooks and listener can find it
+  if (!readTok(ad.key)) saveTok(ad.key, { token, runtime: ad.runtime, base: BASE });
+  if (WIN && ["claude", "codex"].includes(ad.key)) { try { execFileSync("setx", [ad.tokenEnv, token], { stdio: "ignore" }); ok("user env var " + ad.tokenEnv + " set (new terminals)"); } catch { warn("could not setx " + ad.tokenEnv + "; the .tok file is enough for the hooks and listener"); } }
+  else warn("export " + ad.tokenEnv + "=" + token.slice(0, 8) + "... in your shell profile (the .tok file covers hooks/listener)");
+  // 2. MCP server in the client
+  const m = ad.mcpWire({ url: BASE, token, oauth: args.includes("--oauth") });
+  const r = m.apply();
+  if (r.ok) ok("MCP server registered in " + ad.label + (r.note ? " (" + r.note + ")" : "")); else { warn("MCP not auto-registered (" + r.why + "). Run:\n      " + m.command); }
+  // 3. hooks
+  const hw = ad.hooksWire({ repo: REPO });
+  if (ad.hooksFile && hw.hooks) {
+    let cur = {}; try { cur = JSON.parse(readFileSync(ad.hooksFile, "utf8")); } catch {}
+    const merged = mergeHooks(cur, hw);
+    mkdirSync(dirname(ad.hooksFile), { recursive: true });
+    writeFileSync(ad.hooksFile, JSON.stringify(merged, null, 2));
+    ok("hooks merged into " + ad.hooksFile + " (" + Object.keys(hw.hooks).join(", ") + (hw.statusLine ? ", statusLine" : "") + ")");
+    if (hw.note) warn(hw.note);
+  } else if (hw.note) warn(hw.note);
+  // 4. listener launcher + startup (Claude Desktop shares the Claude Code listener/token; nothing of its own)
+  if (["claude-desktop", "cursor", "gemini", "windsurf"].includes(ad.key)) { warn("no listener of its own; if Claude Code or Codex is wired on this machine its listener already covers toasts and files"); return; }
+  const cmdFile = join(REPO, "run_listen_" + ad.key + ".cmd");
+  if (WIN) {
+    if (!existsSync(cmdFile)) writeFileSync(cmdFile, "@echo off\r\ncd /d " + REPO + "\r\nnode scripts\\listen.mjs --runtime " + ad.key + " >> \"%USERPROFILE%\\.agentchan\\listen-" + ad.key + ".log\" 2>&1\r\n");
+    const startup = join(process.env.APPDATA || join(H, "AppData", "Roaming"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
+    const vbs = join(startup, "agent-channel-" + ad.key + ".vbs");
+    try { mkdirSync(startup, { recursive: true }); writeFileSync(vbs, 'Set sh = CreateObject("WScript.Shell")\r\nsh.Run """' + cmdFile + '""", 0, False\r\n'); ok("listener starts at logon (" + vbs + ")"); }
+    catch (e) { warn("could not write startup entry: " + e.message); }
+    // start now if not running
+    if (!listenerFresh(ad)) { try { spawn("wscript", [vbs], { detached: true, stdio: "ignore", windowsHide: true }).unref(); ok("listener started now"); } catch { warn("start the listener: " + cmdFile); } }
+    else ok("listener already running");
+  } else if (platform() === "darwin") {
+    // macOS: a per-user LaunchAgent keeps the listener alive across logins (KeepAlive) and starts it now
+    const label = "com.agentchannel.listen." + ad.key;
+    const plistDir = join(H, "Library", "LaunchAgents"), plist = join(plistDir, label + ".plist");
+    const nodeBin = which("node") || process.execPath;
+    const logDir = join(H, ".agentchan"); mkdirSync(logDir, { recursive: true });
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>${label}</string>
+  <key>ProgramArguments</key><array><string>${nodeBin}</string><string>${join(REPO, "scripts", "listen.mjs")}</string><string>--runtime</string><string>${ad.key}</string></array>
+  <key>WorkingDirectory</key><string>${REPO}</string>
+  <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${join(logDir, "listen-" + ad.key + ".log")}</string>
+  <key>StandardErrorPath</key><string>${join(logDir, "listen-" + ad.key + ".log")}</string>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>${process.env.PATH || "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin"}</string><key>HOME</key><string>${H}</string></dict>
+</dict></plist>
+`;
+    try {
+      mkdirSync(plistDir, { recursive: true }); writeFileSync(plist, xml);
+      try { execFileSync("launchctl", ["bootout", "gui/" + process.getuid() + "/" + label], { stdio: "ignore" }); } catch {}
+      try { execFileSync("launchctl", ["bootstrap", "gui/" + process.getuid(), plist], { stdio: "ignore" }); }
+      catch { execFileSync("launchctl", ["load", "-w", plist], { stdio: "ignore" }); }
+      ok("listener installed as LaunchAgent " + label + " (starts at login, restarts if it dies, log ~/.agentchan/listen-" + ad.key + ".log)");
+    } catch (e) { warn("could not install the LaunchAgent (" + e.message.slice(0, 120) + "). Run by hand: node " + join(REPO, "scripts/listen.mjs") + " --runtime " + ad.key); }
+  } else {
+    // Linux: systemd --user unit when available, otherwise tell them how
+    const unitDir = join(H, ".config", "systemd", "user"), unit = join(unitDir, "agent-channel-" + ad.key + ".service");
+    const nodeBin = which("node") || process.execPath;
+    if (which("systemctl")) {
+      try {
+        mkdirSync(unitDir, { recursive: true });
+        writeFileSync(unit, "[Unit]\nDescription=Agent Channel listener (" + ad.key + ")\nAfter=network-online.target\n\n[Service]\nExecStart=" + nodeBin + " " + join(REPO, "scripts", "listen.mjs") + " --runtime " + ad.key + "\nWorkingDirectory=" + REPO + "\nRestart=always\nRestartSec=5\nEnvironment=HOME=" + H + "\n\n[Install]\nWantedBy=default.target\n");
+        execFileSync("systemctl", ["--user", "daemon-reload"], { stdio: "ignore" });
+        execFileSync("systemctl", ["--user", "enable", "--now", "agent-channel-" + ad.key + ".service"], { stdio: "ignore" });
+        ok("listener installed as systemd user service agent-channel-" + ad.key + " (enable-linger to survive logout: loginctl enable-linger $USER)");
+      } catch (e) { warn("could not install the systemd unit (" + e.message.slice(0, 120) + "). Run by hand: node " + join(REPO, "scripts/listen.mjs") + " --runtime " + ad.key); }
+    } else warn("run the listener in the background:  node " + join(REPO, "scripts/listen.mjs") + " --runtime " + ad.key + "   (tmux/nohup; the token is read from ~/.agentchan/tok." + ad.key + ".json)");
+  }
+}
+
+const startHint = (ad) => WIN ? "run_listen_" + ad.key + ".cmd (in " + REPO + ")" : platform() === "darwin" ? "launchctl kickstart -k gui/$(id -u)/com.agentchannel.listen." + ad.key + "  (or: agent-channel wire)" : "systemctl --user restart agent-channel-" + ad.key + "  (or: agent-channel wire)";
+function ownerHandle(ad) {
+  const root = join(H, ".agentchan");
+  try { for (const h of readdirSync(root)) { try { if (readFileSync(join(root, h, "owner." + ad.key), "utf8") === "1") return h; } catch {} } } catch {}
+  return null;
+}
+function listenerFresh(ad) {
+  const h = ownerHandle(ad); if (!h) return false;
+  const fresh = (f, ms) => { try { return Date.now() - statSync(join(H, ".agentchan", h, f)).mtimeMs < ms; } catch { return false; } };
+  return fresh("heartbeat", 3 * 60_000) || fresh("peek.json", 10 * 60_000); // heartbeat every 30s (listeners started before v0.3 only refresh peek.json on events)
+}
+
+// ---------------- doctor ----------------
+async function doctor() {
+  say("Agent Channel doctor  (server " + BASE + ")");
+  try { const h = await api("/health"); ok("server reachable, listeners connected: " + h.listeners); } catch (e) { bad("server unreachable: " + e.message); }
+  const ads = [ADAPTERS.claude, ADAPTERS.codex, ADAPTERS["claude-desktop"]].filter((a) => a.detect());
+  if (!ads.length) warn("no Claude Code, Codex, or Claude Desktop install detected");
+  for (const ad of ads) {
+    say("");
+    say(ad.label + ":");
+    const token = tokenFor(ad);
+    if (!token) { bad("no token (" + ad.tokenEnv + " or " + tokFile(ad.key) + "). Join with an invite: setup.mjs join <code> <handle> \"<Name>\" --runtime " + ad.key); continue; }
+    let me = null;
+    try { me = await api("/peek", null, token); ok("token valid, you are @" + me.handle + " (" + (me.unread_messages + me.proposals_awaiting_you + me.artifacts_waiting) + " waiting)"); }
+    catch (e) { bad("token rejected: " + e.message + (e.cause ? " (" + (e.cause.code || e.cause.message) + ")" : "")); }
+    const m = ad.mcpWire({ url: BASE, token }); const c = m.check();
+    if (c === true) ok("MCP server registered"); else if (c === false) bad("MCP server not registered. " + (ad.key === "claude-desktop" ? "Run: node scripts/setup.mjs wire --runtime desktop   (or Desktop > Settings > Connectors > Add custom connector > " + BASE + "/mcp)" : m.command.split(String.fromCharCode(10))[0])); else warn("could not check MCP registration (client CLI not on PATH)");
+    if (ad.hooksFile) {
+      let txt = ""; try { txt = readFileSync(ad.hooksFile, "utf8"); } catch {}
+      const has = (name) => txt.includes("hooks/" + name) || txt.includes("hooks\\\\" + name) || txt.includes("hooks\\" + name);
+      has("inbox.mjs") ? ok("inbox hook (type-to-send + waiting banner) wired") : bad("inbox hook missing in " + ad.hooksFile + "  (setup.mjs wire --runtime " + ad.key + ")");
+      if (ad.supportsFileChanged) has("notify.mjs") ? ok("idle notifications (FileChanged) wired") : warn("FileChanged notify hook missing");
+      if (ad.key === "claude") has("claude-status.mjs") ? ok("status hooks wired") : warn("status hooks missing");
+    }
+    if (["claude-desktop", "cursor", "gemini", "windsurf"].includes(ad.key)) continue;
+    const h = ownerHandle(ad);
+    if (!h) bad("listener has never connected for this runtime (no owner marker). Start it: " + startHint(ad));
+    else if (listenerFresh(ad)) ok("listener running as @" + h);
+    else bad("listener not running or started before v0.3 (no fresh heartbeat). Restart it: " + startHint(ad));
+    if (h) { const keys = join(H, ".agentchan", h, "keys"); existsSync(keys) && readdirSync(keys).length ? ok("E2E key present (files can be received)") : warn("no E2E key yet; the listener registers one on first connect"); }
+    if (me && ad.key === "claude") {
+      const cc = which("claude"); if (!cc) warn("claude CLI not on PATH (fine if you use the desktop app)");
+    }
+  }
+  say("");
+  say("Type  @<handle> hello  in a prompt to send a message with no model turn. Ask your agent for  my_work  to see the ledger.");
+}
+
+if (cmd === "join") await join_();
+else if (cmd === "wire") { const ads = runtimesWanted(); for (const ad of ads) await wire(ad, opt("--token") || tokenFor(ad)); }
+else if (cmd === "doctor" || cmd === "status") await doctor();
+else { say("usage: setup.mjs join <inv_code> <handle> \"<Display Name>\" [--runtime claude|codex|both] [--email x]\n       setup.mjs wire [--runtime claude|codex|desktop|both|all] [--token ac_...] [--oauth] [--dry-run]\n       setup.mjs doctor"); process.exit(1); }
