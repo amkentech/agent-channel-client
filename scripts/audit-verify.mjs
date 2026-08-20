@@ -46,7 +46,7 @@ if (wrapped && !args.includes("--no-sig")) {
     let pem = null, from = "";
     if (opt("--pubkey")) { pem = readFileSync(opt("--pubkey"), "utf8"); from = opt("--pubkey"); }
     else {
-      const url = opt("--pubkey-url") || ((body.server || "https://agent-channel-production.up.railway.app").replace(/\/$/, "") + "/.well-known/agentchan-signing-key.json");
+      const url = opt("--pubkey-url") || ((body.server || "https://channel.amkentech.com").replace(/\/$/, "") + "/.well-known/agentchan-signing-key.json");
       try { const j = await (await fetch(url, { signal: AbortSignal.timeout(10000) })).json(); pem = j.public_key_pem; from = url + " (kid " + j.kid + ")"; if (body.signing_key?.public_key_pem && body.signing_key.public_key_pem !== pem) console.log("note: the key embedded in the export differs from the one the server publishes now (rotation?)"); }
       catch (e) { console.log("could not fetch the public key (" + e.message + "); pass --pubkey <pem> or --no-sig"); }
     }

@@ -29,7 +29,7 @@ async function codexPush(text) {
   console.log("[listen] codex push " + (r.ok ? "ok (" + r.mode + ", thread " + String(r.threadId).slice(0, 8) + ")" : "skipped: " + r.reason));
 }
 
-const BASE = (process.env.AGENTCHAN_URL || "https://agent-channel-production.up.railway.app").replace(/\/mcp$/, "");
+const BASE = (process.env.AGENTCHAN_URL || "https://channel.amkentech.com").replace(/\/mcp$/, "");
 const rtArg = process.argv.includes("--runtime") ? process.argv[process.argv.indexOf("--runtime") + 1] : null;
 let token = rtArg === "codex" ? (process.env.AGENTCHAN_CODEX_TOKEN || process.env.AGENTCHAN_TOKEN) : process.env.AGENTCHAN_TOKEN;
 if (!token && rtArg) { const { tokenFor } = await import("../lib/paths.mjs"); token = tokenFor(rtArg); }

@@ -29,7 +29,7 @@ if (IN_NPX_CACHE && !process.env.AGENTCHAN_NO_SELF_INSTALL) {
   console.log("  installed client to " + CLIENT_HOME + " (hooks and the listener run from there; re-run join/wire from any npx to update)");
   REPO = CLIENT_HOME;
 }
-const BASE = (process.env.AGENTCHAN_URL || "https://agent-channel-production.up.railway.app").replace(/\/mcp$/, "");
+const BASE = (process.env.AGENTCHAN_URL || "https://channel.amkentech.com").replace(/\/mcp$/, "");
 const args = process.argv.slice(2);
 const cmd = args[0];
 const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };

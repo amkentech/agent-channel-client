@@ -27,7 +27,7 @@ import { tokenFor } from "../lib/paths.mjs";
 
 const runtime = (process.argv[2] || "claude").toLowerCase();
 let eventName = process.argv[3] || "";
-const url = (process.env.AGENTCHAN_URL || "https://agent-channel-production.up.railway.app").replace(/\/mcp$/, "");
+const url = (process.env.AGENTCHAN_URL || "https://channel.amkentech.com").replace(/\/mcp$/, "");
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 let token = tokenFor(runtime);
 if (!token) process.exit(0);

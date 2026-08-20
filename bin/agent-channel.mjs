@@ -33,7 +33,7 @@ if (!cmd || !map[cmd]) {
   call <tool> '<json args>'
   verify <contract_id> ...
 
-Server: ${process.env.AGENTCHAN_URL || "https://agent-channel-production.up.railway.app"}   Tokens: ~/.agentchan/tok.<runtime>.json`);
+Server: ${process.env.AGENTCHAN_URL || "https://channel.amkentech.com"}   Tokens: ~/.agentchan/tok.<runtime>.json`);
   process.exit(cmd ? 1 : 0);
 }
 const [script, ...pre] = map[cmd];

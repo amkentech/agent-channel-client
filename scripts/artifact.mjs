@@ -20,7 +20,7 @@ const args = process.argv.slice(2);
 const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : undefined; };
 const has = (name) => args.includes(name);
 const runtime = (flag("--runtime") || process.env.AGENTCHAN_RUNTIME || "claude").toLowerCase();
-const BASE = (process.env.AGENTCHAN_URL || "https://agent-channel-production.up.railway.app").replace(/\/mcp$/, "");
+const BASE = (process.env.AGENTCHAN_URL || "https://channel.amkentech.com").replace(/\/mcp$/, "");
 let token = process.env.AGENTCHAN_TOKEN;
 if (runtime === "codex" && process.env.AGENTCHAN_CODEX_TOKEN) token = process.env.AGENTCHAN_CODEX_TOKEN;
 if (!token) { const { tokenFor } = await import("../lib/paths.mjs"); token = tokenFor(runtime); }

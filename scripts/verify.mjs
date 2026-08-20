@@ -16,7 +16,7 @@ import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-const BASE = (process.env.AGENTCHAN_URL || "https://agent-channel-production.up.railway.app").replace(/\/mcp$/, "");
+const BASE = (process.env.AGENTCHAN_URL || "https://channel.amkentech.com").replace(/\/mcp$/, "");
 const token = process.env.AGENTCHAN_TOKEN;
 const args = process.argv.slice(2);
 const proposalId = args.find((a) => !a.startsWith("--"));

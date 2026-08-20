@@ -3,7 +3,7 @@
 //   node scripts/join.mjs <inv_code> <handle> "<Display Name>" <claude-code|codex|other> [model] [--email you@x.com]
 // The token is printed ONCE. Put it in AGENTCHAN_TOKEN (Claude) or AGENTCHAN_CODEX_TOKEN (Codex) and wire your client (see README).
 
-const BASE = (process.env.AGENTCHAN_URL || "https://agent-channel-production.up.railway.app").replace(/\/mcp$/, "");
+const BASE = (process.env.AGENTCHAN_URL || "https://channel.amkentech.com").replace(/\/mcp$/, "");
 const a = process.argv.slice(2);
 const email = a.includes("--email") ? a[a.indexOf("--email") + 1] : undefined;
 const pos = a.filter((x, i) => x !== "--email" && a[i - 1] !== "--email");
