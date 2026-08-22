@@ -39,7 +39,7 @@ console.log("Verifying " + p.id + "\n  task: " + p.task + "\n  scope: " + JSON.s
 
 const sh = (cmd) => execSync(cmd, { cwd: repoDir, stdio: ["ignore", "pipe", "pipe"], encoding: "utf8" }).trim();
 const checks = [];
-const add = (name, pass, detail) => { checks.push({ name, pass, detail }); console.log((pass ? "  ok   " : "  FAIL ") + name + (detail ? " - " + detail : "")); };
+const add = (name, pass, detail, examined) => { checks.push({ name, pass, detail, examined }); console.log((pass ? "  ok   " : "  FAIL ") + name + (detail ? " - " + detail : "")); };
 
 // ref_exists
 let target = ref.commit || ref.branch || null;
@@ -50,7 +50,7 @@ if (!target) {
   let ok = false, detail = "";
   try { sh("git cat-file -e " + target + "^{commit}"); ok = true; detail = target; }
   catch { try { sh("git cat-file -e origin/" + target + "^{commit}"); ok = true; target = "origin/" + target; detail = target; } catch { detail = "not found: " + target; } }
-  add("ref_exists", ok, detail);
+  add("ref_exists", ok, detail, "local git object database after fetching all remotes");
 }
 
 // scope_respected
@@ -61,7 +61,7 @@ if (target && checks[0].pass) {
     const files = sh("git diff --name-only " + base + " " + target).split("\n").filter(Boolean);
     const res = scope.map(globToRe);
     const outside = files.filter((f) => !res.some((r) => r.test(f)) && !scope.includes(f));
-    add("scope_respected", outside.length === 0, files.length + " file(s) changed" + (outside.length ? "; outside scope: " + outside.join(", ") : ""));
+    add("scope_respected", outside.length === 0, files.length + " file(s) changed" + (outside.length ? "; outside scope: " + outside.join(", ") : ""), files.length + " changed file path(s) vs " + scope.length + " declared scope glob(s); paths only, not contents");
     if (ref.outcome === "no_change_needed") add("no_change_needed", files.length === 0, files.length ? "claims no change but " + files.length + " file(s) differ" : "no diff");
   } catch (e) { add("scope_respected", false, "could not diff: " + e.message.split("\n")[0]); }
 }
@@ -74,7 +74,7 @@ if (target && checks[0].pass && !noTests) {
     sh("git worktree add --detach " + JSON.stringify(wt) + " " + target);
     const pkgPath = join(wt, "package.json");
     const pkg = existsSync(pkgPath) ? JSON.parse(readFileSync(pkgPath, "utf8")) : {};
-    const run = (name, cmd) => { try { execSync(cmd, { cwd: wt, stdio: "pipe", encoding: "utf8", timeout: 300_000 }); add(name, true); } catch (e) { add(name, false, (e.stdout || e.stderr || e.message).toString().slice(-300)); } };
+    const run = (name, cmd) => { try { execSync(cmd, { cwd: wt, stdio: "pipe", encoding: "utf8", timeout: 300_000 }); add(name, true, undefined, cmd + " at the returned ref in a clean worktree"); } catch (e) { add(name, false, (e.stdout || e.stderr || e.message).toString().slice(-300), cmd + " at the returned ref in a clean worktree"); } };
     if (pkg.scripts?.test) { if (existsSync(join(wt, "package-lock.json"))) run("install", "npm ci --silent"); run("tests", "npm test --silent"); } else add("tests", true, "skipped: no test script");
     if (pkg.scripts?.build) run("build", "npm run build --silent");
   } finally { try { sh("git worktree remove --force " + JSON.stringify(wt)); } catch {} }
@@ -82,6 +82,8 @@ if (target && checks[0].pass && !noTests) {
 
 const allPass = checks.every((c) => c.pass);
 console.log(allPass ? "ALL CHECKS PASS" : "CHECKS FAILED");
-if (!noPost) { const r = await call("post_checks", { proposal_id: p.id, checks }); console.log("posted:", JSON.stringify(r)); }
+// Passing over what these checks cover must not read as passing over what they don't.
+const notChecked = ["runtime behavior (nothing was executed beyond test/build scripts)", "code quality or correctness of the diff contents", "files and state outside the returned ref's diff"];
+if (!noPost) { const r = await call("post_checks", { proposal_id: p.id, checks, not_checked: notChecked }); console.log("posted:", JSON.stringify(r)); }
 await client.close();
 process.exit(allPass ? 0 : 3);

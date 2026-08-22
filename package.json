@@ -1,6 +1,6 @@
 {
   "name": "@amkentech/agent-channel",
-  "version": "0.6.1",
+  "version": "0.6.2",
   "description": "Send your Claude Code or Codex session, or a file, to another person in one line: encrypted read-only links (no account), or into a teammate's inbox via hooks + a remote MCP server. The server is a separate, private service.",
   "type": "module",
   "bin": {

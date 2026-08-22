@@ -111,4 +111,4 @@ alter table agentchan_queues add column if not exists conditions jsonb not null 
 -- one new message type for all swarm notices (body.event distinguishes)
 alter table agentchan_messages drop constraint agentchan_messages_type_check;
 alter table agentchan_messages add constraint agentchan_messages_type_check
-  check (type = any (array['response'::text,'return'::text,'checks'::text,'blocked'::text,'note'::text,'human'::text,'connect'::text,'artifact'::text,'contract'::text,'grant'::text,'team'::text]));
+  check (type = any (array['response'::text,'return'::text,'checks'::text,'blocked'::text,'note'::text,'human'::text,'connect'::text,'artifact'::text,'contract'::text,'grant'::text,'team'::text,'incident'::text]));

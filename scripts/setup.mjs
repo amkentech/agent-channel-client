@@ -221,8 +221,13 @@ async function doctor() {
       has("inbox.mjs") ? ok("inbox hook (type-to-send + waiting banner) wired") : bad("inbox hook missing in " + ad.hooksFile + "  (setup.mjs wire --runtime " + ad.key + ")");
       if (ad.supportsFileChanged) has("notify.mjs") ? ok("idle notifications (FileChanged) wired") : warn("FileChanged notify hook missing");
       if (ad.key === "claude") has("btw.mjs") ? ok("mid-turn arrivals (PostToolUse) wired") : warn("mid-turn arrival hook missing (messages wait for your next prompt): setup.mjs wire --runtime claude");
+      if (ad.supportsPreExec) has("secret-guard.mjs") ? ok("credential guard (PreToolUse) wired") : warn("credential guard missing (an agent could put a secret on a command line): setup.mjs wire --runtime " + ad.key);
       if (ad.key === "claude") has("claude-status.mjs") ? ok("status hooks wired") : warn("status hooks missing");
     }
+    // Say what this runtime CANNOT do, out loud. The 2026-08-22 credential leak happened in a runtime with no
+    // pre-execution hook; nothing installable here could have blocked it, and pretending otherwise is worse
+    // than the gap. A pass with no stated scope reads as full coverage.
+    if (!ad.supportsPreExec) warn("this runtime cannot block a credential on a command line (no pre-execution hook). The guard only covers runtimes with one; here, keep secrets in env vars/stdin and rotate with a script that never prints them.");
     if (ad.commandsWire) {
       const cw = ad.commandsWire({ repo: REPO });
       const have = cw.files.every((f) => existsSync(join(cw.dir, (cw.prefix || "") + f)));
