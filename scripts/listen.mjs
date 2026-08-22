@@ -101,7 +101,11 @@ function connect() {
     let ev; try { ev = JSON.parse(buf.toString()); } catch { return; }
     if (ev.type === "hello") {
       handle = ev.person; myRuntime = String(ev.runtime || ""); ensureDir();
-      writeFileSync(join(dir, "owner." + (ev.runtime || "unknown").replace(/-code$/, "")), "1");
+      const rtKey = (ev.runtime || "unknown").replace(/-code$/, "");
+      writeFileSync(join(dir, "owner." + rtKey), "1");
+      // pid file: both launchers run the same command line (they differ only by env), so a watchdog cannot tell
+      // the runtimes apart from the process list. The listener is the only thing that knows which it is.
+      try { writeFileSync(join(homedir(), ".agentchan", "listener." + rtKey + ".pid"), JSON.stringify({ pid: process.pid, handle, runtime: ev.runtime, started_at: new Date().toISOString() })); } catch {}
       console.log("[listen] listening as @" + handle + " (" + ev.agent + ")");
       try {
         const label = (ev.agent + "-" + ev.runtime + "-" + hostname()).toLowerCase();

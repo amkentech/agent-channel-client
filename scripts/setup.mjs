@@ -220,6 +220,7 @@ async function doctor() {
       const has = (name) => txt.includes("hooks/" + name) || txt.includes("hooks\\\\" + name) || txt.includes("hooks\\" + name);
       has("inbox.mjs") ? ok("inbox hook (type-to-send + waiting banner) wired") : bad("inbox hook missing in " + ad.hooksFile + "  (setup.mjs wire --runtime " + ad.key + ")");
       if (ad.supportsFileChanged) has("notify.mjs") ? ok("idle notifications (FileChanged) wired") : warn("FileChanged notify hook missing");
+      if (ad.key === "claude") has("btw.mjs") ? ok("mid-turn arrivals (PostToolUse) wired") : warn("mid-turn arrival hook missing (messages wait for your next prompt): setup.mjs wire --runtime claude");
       if (ad.key === "claude") has("claude-status.mjs") ? ok("status hooks wired") : warn("status hooks missing");
     }
     if (ad.commandsWire) {
