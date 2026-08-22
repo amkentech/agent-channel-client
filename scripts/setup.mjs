@@ -105,6 +105,7 @@ async function wire(ad, token) {
     say("  would: save token to " + tokFile(ad.key) + (WIN && ["claude", "codex"].includes(ad.key) ? " and setx " + ad.tokenEnv : ""));
     say("  would: " + m.command.split(String.fromCharCode(10))[0]);
     if (ad.hooksFile) say("  would: merge hooks into " + ad.hooksFile + " (" + Object.keys(hw.hooks || {}).join(", ") + ")"); else say("  note: " + (hw.note || "no hooks for this runtime"));
+    if (ad.commandsWire) { const cw = ad.commandsWire({ repo: REPO }); say("  would: install slash commands to " + cw.dir + " (" + cw.files.map((f) => cw.invokeAs(f)).join(", ") + ")"); }
     if (ad.key !== "claude-desktop") say("  would: install the listener to start at login (" + (WIN ? "Startup folder + run_listen_" + ad.key + ".cmd" : platform() === "darwin" ? "LaunchAgent com.agentchannel.listen." + ad.key : "systemd --user unit") + ") and start it now");
     return;
   }
@@ -126,6 +127,13 @@ async function wire(ad, token) {
     ok("hooks merged into " + ad.hooksFile + " (" + Object.keys(hw.hooks).join(", ") + (hw.statusLine ? ", statusLine" : "") + ")");
     if (hw.note) warn(hw.note);
   } else if (hw.note) warn(hw.note);
+  // 3.5 slash commands (source files in repo/commands/, copied as-is; dir/prefix/invokeAs are per-adapter in lib/adapters.mjs)
+  if (ad.commandsWire) {
+    const cw = ad.commandsWire({ repo: REPO });
+    mkdirSync(cw.dir, { recursive: true });
+    for (const f of cw.files) writeFileSync(join(cw.dir, (cw.prefix || "") + f), readFileSync(join(cw.source, f), "utf8"));
+    ok("slash commands installed to " + cw.dir + " (" + cw.files.map((f) => cw.invokeAs(f)).join(", ") + ")");
+  }
   // 4. listener launcher + startup (Claude Desktop shares the Claude Code listener/token; nothing of its own)
   if (["claude-desktop", "cursor", "gemini", "windsurf"].includes(ad.key)) { warn("no listener of its own; if Claude Code or Codex is wired on this machine its listener already covers toasts and files"); return; }
   const cmdFile = join(REPO, "run_listen_" + ad.key + ".cmd");
@@ -214,12 +222,39 @@ async function doctor() {
       if (ad.supportsFileChanged) has("notify.mjs") ? ok("idle notifications (FileChanged) wired") : warn("FileChanged notify hook missing");
       if (ad.key === "claude") has("claude-status.mjs") ? ok("status hooks wired") : warn("status hooks missing");
     }
+    if (ad.commandsWire) {
+      const cw = ad.commandsWire({ repo: REPO });
+      const have = cw.files.every((f) => existsSync(join(cw.dir, (cw.prefix || "") + f)));
+      have ? ok("slash commands wired (" + cw.files.map((f) => cw.invokeAs(f)).join(", ") + ")") : bad("slash commands missing in " + cw.dir + "  (setup.mjs wire --runtime " + ad.key + ")");
+    }
     if (["claude-desktop", "cursor", "gemini", "windsurf"].includes(ad.key)) continue;
     const h = ownerHandle(ad);
     if (!h) bad("listener has never connected for this runtime (no owner marker). Start it: " + startHint(ad));
     else if (listenerFresh(ad)) ok("listener running as @" + h);
     else bad("listener not running or started before v0.3 (no fresh heartbeat). Restart it: " + startHint(ad));
-    if (h) { const keys = join(H, ".agentchan", h, "keys"); existsSync(keys) && readdirSync(keys).length ? ok("E2E key present (files can be received)") : warn("no E2E key yet; the listener registers one on first connect"); }
+    if (h) {
+      // E2E key health: fingerprint every local key and cross-check it against the server's registry, so a revoked or
+      // unregistered key is a doctor finding, not a mystery at send time. Retired keys (kept after rotate so old
+      // artifacts still decrypt) are expected to be revoked server-side and are skipped.
+      const { loadLocalKeys } = await import("../lib/crypto.mjs");
+      const { createHash } = await import("node:crypto");
+      const fp = (pub) => createHash("sha256").update(String(pub)).digest("hex").match(/.{4}/g).slice(0, 4).join(" ");
+      const local = loadLocalKeys(h).filter((k) => !String(k.label || "").includes("-retired-"));
+      if (!local.length) warn("no E2E key yet; the listener registers one on first connect (or: node scripts/artifact.mjs keygen)");
+      else if (token) {
+        try {
+          const mine = await api("/keys", null, token);
+          for (const k of local) {
+            const s = mine.keys.find((x) => x.id === k.key_id);
+            if (s && !s.revoked_at) ok("E2E key " + fp(k.public_key) + "  " + (k.label || "") + " (registered; files can be received)");
+            else if (s?.revoked_at) bad("local key " + fp(k.public_key) + "  " + (k.label || "") + " was REVOKED on the server " + String(s.revoked_at).slice(0, 10) + ". Rotate: node scripts/artifact.mjs rotate");
+            else warn("local key " + fp(k.public_key) + "  " + (k.label || "") + " is not registered on the server (the listener registers it on connect, or: node scripts/artifact.mjs keygen)");
+          }
+          const elsewhere = mine.keys.filter((x) => !x.revoked_at && !loadLocalKeys(h).some((k) => k.key_id === x.id));
+          if (elsewhere.length) warn(elsewhere.length + " other active key(s) registered for you (other devices/runtimes): " + elsewhere.map((x) => fp(x.public_key) + " " + (x.label || x.runtime || "")).join(", ") + ". Lost a device? node scripts/artifact.mjs revoke-key <id>");
+        } catch { ok("E2E key present locally (" + local.map((k) => fp(k.public_key)).join(", ") + "); could not cross-check the server"); }
+      } else ok("E2E key present locally (" + local.map((k) => fp(k.public_key)).join(", ") + "); no valid token to cross-check the server");
+    }
     if (me && ad.key === "claude") {
       const cc = which("claude"); if (!cc) warn("claude CLI not on PATH (fine if you use the desktop app)");
     }

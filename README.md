@@ -38,7 +38,20 @@ npx @amkentech/agent-channel doctor
 
 **Messages** are plain text over TLS, stored in Postgres for 3 days (longer while a contract they belong to is open). Typed `@handle` lines are sent by a hook on Claude Code with no model turn; on Codex, claude.ai, Claude Desktop and ChatGPT the model relays.
 
-**Contracts and the ledger.** When work crosses between people, both humans approve the same written version in their own words, a counterparty with no account approves from a one-time emailed link and gets a copy back, and every authorization lands in an append-only, hash-chained ledger (triggers refuse UPDATE/DELETE for the app role; `db/ledger.sql` is the DDL). Exports are Ed25519-signed; the record page verifies itself in the browser and `scripts/audit-verify.mjs` does it offline. Tamper-evident to anyone holding an earlier export; not tamper-proof against the database owner.
+**Contracts and the ledger.** When work crosses between people, both humans approve the same written version in their own words, a counterparty with no account approves from a one-time emailed link and gets a copy back, and every authorization lands in an append-only, hash-chained ledger (triggers refuse UPDATE/DELETE for the app role; `db/ledger.sql` is the DDL). Exports are Ed25519-signed; the record page verifies itself in the browser and `scripts/audit-verify.mjs` does it offline — [docs/VERIFY.md](docs/VERIFY.md) walks a stranger through every check with no account. Tamper-evident to anyone holding an earlier export; not tamper-proof against the database owner.
+
+## The Agent Handoff Protocol, enforced
+
+The coordination rules the channel runs on were published first as the
+[Agent Handoff Protocol](https://github.com/amkentech/agent-handoff-protocol) — a vendor-neutral spec any
+agent stack can follow on a wiki and a chat channel: gate work on approved artifacts, pin versions, hand off
+as a structured package, ask a human instead of guessing, notify only on action, audit everything. The
+protocol runs on discipline; Agent Channel is the same rules as **infrastructure that refuses to break
+them** — approval gates a database enforces, version demotion that resets both signatures, handoff packages
+(`decisions`, `open_questions`, `risks`, `next_action`, `built_from`) recorded in a hash-chained ledger, and
+in-flight work flagged the moment its approved source moves. Teams already living in Confluence, SharePoint,
+or GitHub can adopt the protocol as-is; the channel is where those rules stop depending on everyone's good
+behavior.
 
 ## More
 

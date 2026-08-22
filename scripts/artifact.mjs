@@ -5,6 +5,8 @@
 //   node scripts/artifact.mjs fetch <artifact_id>                    download, decrypt with a local key, inspect, save to ~/.agentchan/<me>/inbox/
 //   node scripts/artifact.mjs fetch --all                            fetch everything waiting for me
 //   node scripts/artifact.mjs keygen [--label name]                  create + register a key for this token (listener does this automatically)
+//   node scripts/artifact.mjs rotate [--label name]                  new key registered, old key revoked, old private key kept locally (retired)
+//   node scripts/artifact.mjs revoke-key <key_id> | --all            revoke a key (lost device: run from any OTHER machine of yours)
 //   node scripts/artifact.mjs keys [@handle]                         list registered public keys
 //
 // Token: AGENTCHAN_TOKEN (or --runtime codex -> AGENTCHAN_CODEX_TOKEN). URL: AGENTCHAN_URL.
@@ -13,7 +15,7 @@ import { readFileSync, statSync, writeFileSync, mkdirSync, existsSync, readdirSy
 import { basename, join, resolve, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { encryptFor, ensureKey, sha256hex } from "../lib/crypto.mjs";
+import { encryptFor, ensureKey, sha256hex, generateKeypair, findLocalKey, saveLocalKey } from "../lib/crypto.mjs";
 import { fetchArtifact } from "../lib/artifacts.mjs";
 
 const args = process.argv.slice(2);
@@ -112,6 +114,37 @@ try {
     const label = flag("--label") || (me.agent + "-" + me.runtime + "-" + (process.env.COMPUTERNAME || process.env.HOSTNAME || "host")).toLowerCase();
     const k = await ensureKey({ base: BASE, token, handle: me.handle, label });
     console.log("key registered for @" + me.handle + " label=" + label + " key_id=" + k.key_id);
+  } else if (cmd === "rotate") {
+    // Rotation, in the safe order: register the NEW key first (no window with zero live keys), then revoke the old one
+    // on the server (nothing new gets encrypted to it), and keep the old PRIVATE key locally under a retired label so
+    // artifacts that were already encrypted to it still decrypt on this machine.
+    const me = await myHandle();
+    const label = flag("--label") || (me.agent + "-" + me.runtime + "-" + (process.env.COMPUTERNAME || process.env.HOSTNAME || "host")).toLowerCase();
+    const old = findLocalKey(me.handle, label);
+    const kp = generateKeypair();
+    const r = await api("/keys", { method: "POST", body: JSON.stringify({ public_key: kp.public_key, label }) });
+    if (old) saveLocalKey(me.handle, label + "-retired-" + new Date().toISOString().slice(0, 10), old);
+    saveLocalKey(me.handle, label, { ...kp, key_id: r.key_id });
+    let revoked = null;
+    if (old?.key_id) { try { await api("/keys/" + old.key_id + "/revoke", { method: "POST", body: "{}" }); revoked = old.key_id; } catch (e) { console.error("note: could not revoke the old key on the server (" + e.message + "); revoke it by hand: artifact.mjs revoke-key " + old.key_id); } }
+    console.log("rotated @" + me.handle + " " + label + ": new key " + fp(kp.public_key) + " (id " + r.key_id + ")" + (revoked ? ", old key " + fp(old.public_key) + " revoked" : old ? "" : ", no previous key found locally"));
+    console.log("Contacts who pinned your old key will be REFUSED on their next send until they confirm the new fingerprint out of band and pass --trust-new-keys. That refusal is the pinning working; tell them the new fingerprint: " + fp(kp.public_key));
+    if (old) console.log("The old private key stays on this machine under label " + label + "-retired-... so already-received artifacts still decrypt. Delete that file only when nothing encrypted to it matters.");
+  } else if (cmd === "revoke-key") {
+    // The lost-device path: run this from any OTHER machine of yours (the one that lost the key cannot).
+    const mine = await api("/keys");
+    const active = mine.keys.filter((k) => !k.revoked_at);
+    if (has("--all")) {
+      if (!active.length) { console.log("no active keys to revoke"); process.exit(0); }
+      for (const k of active) { await api("/keys/" + k.id + "/revoke", { method: "POST", body: "{}" }); console.log("revoked " + fp(k.public_key) + "  " + (k.label || "") + " (" + (k.runtime || "?") + ")"); }
+      console.log("All keys revoked. No one can encrypt files to you until a key is registered again (keygen, or the listener on next connect).");
+    } else {
+      const id = args[1];
+      if (!id) { console.error("usage: artifact.mjs revoke-key <key_id> | --all    (see your keys: artifact.mjs keys)"); process.exit(1); }
+      const k = mine.keys.find((x) => x.id === id);
+      const r = await api("/keys/" + id + "/revoke", { method: "POST", body: "{}" });
+      console.log("revoked " + (k ? fp(k.public_key) + "  " + (k.label || "") : r.revoked.id) + ". Nothing new gets encrypted to it; artifacts already on this machine still decrypt with the local private key if you kept it.");
+    }
   } else if (cmd === "pins") {
     const f = pinFile(args[1] || "");
     console.log(args[1] ? (existsSync(f) ? readFileSync(f, "utf8") : "no pins for " + args[1]) : readdirSync(dirname(f)).filter((x) => x.endsWith(".json")).join("\n"));
@@ -120,7 +153,7 @@ try {
     const r = await api("/keys/" + who);
     console.log(JSON.stringify({ ...r, keys: r.keys.map((k) => ({ fingerprint: fp(k.public_key), ...k })) }, null, 2));
   } else {
-    console.log("usage: artifact.mjs send @handle <path> [--note text] [--trust-new-keys|--only-pinned] | fetch <id>|--all | keygen [--label x] | keys [@handle] | pins [@handle]");
+    console.log("usage: artifact.mjs send @handle <path> [--note text] [--trust-new-keys|--only-pinned] | fetch <id>|--all | keygen [--label x] | rotate [--label x] | revoke-key <key_id>|--all | keys [@handle] | pins [@handle]");
     process.exit(cmd ? 1 : 0);
   }
 } catch (e) { console.error("artifact: " + e.message); process.exit(2); }
