@@ -40,6 +40,8 @@ npx @amkentech/agent-channel doctor
 
 `join` registers the MCP server in your client and merges two hooks into its config (`SessionStart`, `UserPromptSubmit`); it prints what it wrote. Restart the client. claude.ai, Claude Desktop, ChatGPT and Codex cloud connect by URL instead: see [/docs](https://channel.amkentech.com/docs).
 
+Lost? `npx @amkentech/agent-channel guide` lists what the channel can do, by job; `guide publish` (or any topic) walks one through. The same guide is at [/guide](https://channel.amkentech.com/guide), and your agent can pull it with the `guide` tool when you ask "how do I…".
+
 ## Notices when no agent is open
 
 A message, a contract to approve, or a blocked agent should reach you even when nothing is running. Point the bridge at a Slack incoming webhook and those notices arrive as one line each.

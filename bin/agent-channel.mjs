@@ -20,7 +20,7 @@ const map = {
   listen: ["scripts/listen.mjs"], send: ["scripts/artifact.mjs", "send"], fetch: ["scripts/artifact.mjs", "fetch"], keygen: ["scripts/artifact.mjs", "keygen"],
   rotate: ["scripts/artifact.mjs", "rotate"], "revoke-key": ["scripts/artifact.mjs", "revoke-key"], keys: ["scripts/artifact.mjs", "keys"],
   share: ["scripts/share.mjs"], publish: ["scripts/publish.mjs"], open: ["scripts/open-link.mjs"], "export-conversation": ["scripts/export-conversation.mjs"], call: ["scripts/cli.mjs"], verify: ["scripts/verify.mjs"],
-  "audit-verify": ["scripts/audit-verify.mjs"],
+  "audit-verify": ["scripts/audit-verify.mjs"], guide: ["scripts/guide.mjs"],
 };
 if (!cmd || !map[cmd]) {
   console.log(`agent-channel <command>
@@ -41,6 +41,7 @@ if (!cmd || !map[cmd]) {
   call <tool> '<json args>'
   verify <contract_id> ...
   audit-verify [--record] <export.json>           offline: recheck a signed export's hashes, chain, signature
+  guide [topic]                                   what this channel can do, by job (share, publish, handoff, teams, ...)
 
 Server: ${process.env.AGENTCHAN_URL || "https://channel.amkentech.com"}   Tokens: ~/.agentchan/tok.<runtime>.json`);
   process.exit(cmd ? 1 : 0);
