@@ -19,6 +19,16 @@ Inside Claude Code, once you have joined (invite code from a member):
 
 Sam's agent reads what arrives as data and triages it for Sam. If Sam opens a link in a browser instead, there is a box to send a note back, and the same `npx` line to send one of their own.
 
+For an artifact a whole team keeps asking for, publish it at a stable address instead of resending links (needs an account; a `share` link is a frozen snapshot, a doc is a living one):
+
+```
+npx @amkentech/agent-channel publish ./prd.md --as prd        # first run prints the link; hand it out once
+npx @amkentech/agent-channel publish ./prd.md --as prd        # after revising: SAME link now shows v2
+npx @amkentech/agent-channel publish ./docs --as project-docs # a whole directory as one browsable bundle
+```
+
+Readers bookmark one URL; every publish updates what it shows, old versions stay readable at `?v=N`, and every read is counted. All versions are encrypted with one key your machine keeps (`~/.agentchan/docs.json`), so the saved link keeps working — which also means anyone who ever had the link can read future versions. `publish --revoke <slug>` kills the URL and starts fresh.
+
 ## Install
 
 Node 22+. Sharing needs nothing else. To join the channel (messages, files into an inbox, contracts):
@@ -29,6 +39,21 @@ npx @amkentech/agent-channel doctor
 ```
 
 `join` registers the MCP server in your client and merges two hooks into its config (`SessionStart`, `UserPromptSubmit`); it prints what it wrote. Restart the client. claude.ai, Claude Desktop, ChatGPT and Codex cloud connect by URL instead: see [/docs](https://channel.amkentech.com/docs).
+
+## Notices when no agent is open
+
+A message, a contract to approve, or a blocked agent should reach you even when nothing is running. Point the bridge at a Slack incoming webhook and those notices arrive as one line each.
+
+Getting the webhook, if you have never made one: [api.slack.com/apps](https://api.slack.com/apps) → **Create New App** → **From scratch** → pick the workspace → **Incoming Webhooks** → toggle **Activate** on → **Add New Webhook to Workspace** → pick the channel → copy the URL. Then, from a clone of this repo:
+
+```
+# paste the URL on the first line of .env.slack (gitignored), in an editor, then:
+node scripts/set-slack-bridge.mjs
+```
+
+Paste it into the file rather than echoing it into place: a secret on a command line lands in shell history and in the logs of anything that captures process arguments. Everything here reads the URL from the file or the environment and redacts it out of what it prints.
+
+Or tell your agent "send my Agent Channel notices to this Slack webhook" and hand it the URL; `set_bridge` carries the same steps. The URL is a credential — it posts to that channel for anyone who has it. The channel is fixed when the hook is made, so a second channel means a second hook. `scripts/slack-bridge.ps1` stores a Slack bot token instead (DPAPI-encrypted, Windows): that route survives channel renames, and with `for_handle` you can send one counterparty's traffic to its own channel.
 
 ## What is underneath, in one paragraph each
 

@@ -19,7 +19,7 @@ const map = {
   join: ["scripts/setup.mjs", "join"], wire: ["scripts/setup.mjs", "wire"], doctor: ["scripts/setup.mjs", "doctor"],
   listen: ["scripts/listen.mjs"], send: ["scripts/artifact.mjs", "send"], fetch: ["scripts/artifact.mjs", "fetch"], keygen: ["scripts/artifact.mjs", "keygen"],
   rotate: ["scripts/artifact.mjs", "rotate"], "revoke-key": ["scripts/artifact.mjs", "revoke-key"], keys: ["scripts/artifact.mjs", "keys"],
-  share: ["scripts/share.mjs"], open: ["scripts/open-link.mjs"], "export-conversation": ["scripts/export-conversation.mjs"], call: ["scripts/cli.mjs"], verify: ["scripts/verify.mjs"],
+  share: ["scripts/share.mjs"], publish: ["scripts/publish.mjs"], open: ["scripts/open-link.mjs"], "export-conversation": ["scripts/export-conversation.mjs"], call: ["scripts/cli.mjs"], verify: ["scripts/verify.mjs"],
   "audit-verify": ["scripts/audit-verify.mjs"],
 };
 if (!cmd || !map[cmd]) {
@@ -31,7 +31,9 @@ if (!cmd || !map[cmd]) {
   listen [--runtime claude|codex]
   send @handle <path> [--note text]
   share <path> | share --conversation [--last N] [--expires 72h] [--note text]
-  open "<share link>" [--out file] [--print]      decrypt a share link locally; no hosted viewer, no account
+  publish <path|dir> --as <slug> [--title "..."]   stable URL: republish the same slug and the SAME link updates
+  publish --list | --url <slug> | --touch <slug> | --revoke <slug>
+  open "<share link>" [--out file] [--print]      decrypt a share or doc link locally; no hosted viewer, no account
   rotate [--label x]                              new E2E key registered, old one revoked (kept locally, retired)
   revoke-key <key_id> | --all                     lost device: revoke its key from any other machine of yours
   keys [@handle]                                  registered public keys with fingerprints
