@@ -9,9 +9,11 @@
 // secret out of Git was necessary and not sufficient -- argv is a disclosure
 // channel too.
 //
-// Two checks, cheapest first:
+// Three checks, cheapest first:
 //   1. Literal match against the values in known credential files.
 //   2. Secret-bearing flags (--password, --token, ...) given an inline value.
+//   3. Operations known to print a credential they were merely given, where a clean
+//      command line proves nothing because the leak happens on the way out.
 //
 // A block here is advisory to the model, not a security boundary: it stops the
 // accident, not an adversary. Exit 0 always -- a crashing hook must not wedge
@@ -37,6 +39,42 @@ const SECRET_FLAGS =
 // for docs, examples, and correct env-var indirection.
 const PLACEHOLDER =
   /^(\$|%|<|"?\$\{|['"]?\s*$|xxx|yyy|placeholder|your[-_]|example|redacted|\*+$|\.\.\.)/i;
+
+// Operations with known credential-disclosure behaviour. Checks 1 and 2 both assume the
+// secret is visible in the command being run; these are the cases where it is not. On
+// 2026-08-22 Supabase CLI v2.115.0 expanded PGPASSWORD into a generated shell script and
+// printed it in --dry-run output: argv was clean, the credential still left the machine,
+// because tool output is a disclosure channel too.
+//
+// Blocking the mode is cruder than redacting the value, but redaction is not available to
+// us: a PostToolUse hook can only append context, never replace a tool result, so by the
+// time the secret is printed it is already in the transcript. PreToolUse is the last point
+// that still runs before the process does. Each entry names its own escape hatch.
+const UNSAFE_OPERATIONS = [
+  {
+    id: "supabase-db-echo",
+    // `supabase db ...` in any mode whose whole job is to print what it would have done.
+    match: /(^|[\s;&|(])(npx\s+(--yes\s+)?)?supabase\s+db\b/i,
+    unsafe: (c) => /(^|\s)(--dry-run|--debug|--verbose|-v)(\s|=|$)/i.test(c),
+    reason:
+      "Blocked: 'supabase db' in a dry-run/debug/verbose mode. This CLI has printed the " +
+      "database password it resolved (v2.115.0 expanded PGPASSWORD into a generated script " +
+      "and echoed it), so the credential reaches tool output even when the command line is " +
+      "clean. Run it without the preview flag, redirect the output to a gitignored file " +
+      "instead of returning it, or ask Johnathan to run it himself.",
+  },
+  {
+    id: "railway-variables-read",
+    // A bare listing prints every value in the environment, ADMIN_KEY and DATABASE_URL included.
+    match: /(^|[\s;&|(])railway\s+variables\b/i,
+    unsafe: (c) => !/(^|\s)--set/i.test(c),
+    reason:
+      "Blocked: 'railway variables' without --set prints every value in the service " +
+      "environment, which here includes ADMIN_KEY and DATABASE_URL. Reading them into tool " +
+      "output discloses them. Use 'railway variables --set-from-stdin KEY' to write, or ask " +
+      "Johnathan to read them himself.",
+  },
+];
 
 function readStdin() {
   try {
@@ -117,6 +155,10 @@ for (const s of secrets()) {
         `If the value genuinely must be inline, ask Johnathan to run the command himself.`
     );
   }
+}
+
+for (const op of UNSAFE_OPERATIONS) {
+  if (op.match.test(command) && op.unsafe(command)) deny(op.reason);
 }
 
 const m = command.match(SECRET_FLAGS);

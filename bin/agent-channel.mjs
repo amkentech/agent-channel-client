@@ -34,6 +34,7 @@ if (!cmd || !map[cmd]) {
   publish <path|dir> --as <slug> [--title "..."]   stable URL: republish the same slug and the SAME link updates
   publish --list | --url <slug> | --touch <slug> | --revoke <slug>
   open "<share link>" [--out file] [--print]      decrypt a share or doc link locally; no hosted viewer, no account
+  open --check [--json]                           docs you have read that moved since you read them
   rotate [--label x]                              new E2E key registered, old one revoked (kept locally, retired)
   revoke-key <key_id> | --all                     lost device: revoke its key from any other machine of yours
   keys [@handle]                                  registered public keys with fingerprints

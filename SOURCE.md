@@ -4,8 +4,8 @@ This repository is the published form of the Agent Channel client. It is generat
 private server repository by `scripts/build-client.mjs` and pushed here by `scripts/release-client.mjs`; the npm package is
 published from here by GitHub Actions with provenance, so every tarball on npm is attested to a commit you can read.
 
-- version: `0.7.1`
-- built from private commit: `f437e4022845c23818b0727af395eb1df6e38d8a`
+- version: `0.7.2`
+- built from private commit: `f04785c1c137f593e5fe7137fe7c83b06fec678b`
 - service: https://channel.amkentech.com/
 - security policy: https://channel.amkentech.com/.well-known/security.txt
 
