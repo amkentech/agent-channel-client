@@ -34,6 +34,7 @@ try { peek = JSON.parse(readFileSync(join(root, handle, "peek.json"), "utf8")).p
 const items = peek?.items || [];
 const humans = items.filter((i) => i.type === "human");
 const humanOnly = items.filter((i) => i.human_only && i.type !== "human");
+const hands = items.filter((i) => i.type === "handoff" && i.for_this_runtime);
 const props = peek?.proposals_awaiting_you || 0;
 
 // files fetched by the listener but not yet surfaced (same seen-file the hook uses)
@@ -53,6 +54,7 @@ if (humans.length) {
   parts.push("\u2709 " + humans.length + " msg" + (humans.length > 1 ? "s" : "") + " | " + last.from + ": " + (t.length > 60 ? t.slice(0, 60) + "..." : t));
 }
 if (files) parts.push("\u{1F4CE} " + files + " file" + (files > 1 ? "s" : "") + (lastFile ? " (" + lastFile.from + ": " + lastFile.filename + (lastFile.verdict !== "clean" ? ", " + lastFile.verdict.toUpperCase() : "") + ")" : ""));
+if (hands.length) { const t = String(hands[hands.length - 1].text || "").replace(/\s+/g, " "); parts.push("\u21C4 handoff for this session: " + (t.length > 50 ? t.slice(0, 50) + "..." : t)); }
 if (props) parts.push("\u{1F4CB} " + props + " proposal" + (props > 1 ? "s" : "") + " for you");
 if (humanOnly.length) parts.push("\u26A0 " + humanOnly.length + " needs YOU (human-only)");
 const online = peek ? "" : " (listener?)";

@@ -2,6 +2,7 @@
 // Offline verifier for Agent Channel exports. No database access; optionally one fetch for the public key.
 //   node scripts/audit-verify.mjs export.json                       audit_trail mode=export (signed wrapper or bare)
 //   node scripts/audit-verify.mjs --record record.json               export_contract / GET /c/:id/record.json
+//   node scripts/audit-verify.mjs --disclosure disclosure.json        disclose_contract / GET /c/:id/disclosure.json (any subset of facts)
 //   options: --pubkey <pem file> | --pubkey-url <url> (default: the server named in the export), --no-sig (skip signature)
 // Checks: every ledger row's hash from its canonical string, every visible chain link, and (if present) the server's Ed25519
 // signature over the sha256 of the canonical JSON body, against a public key you supply or fetch. Pin the key out of band
@@ -12,9 +13,46 @@ import { createHash, createPublicKey, verify as edVerify } from "node:crypto";
 const args = process.argv.slice(2);
 const opt = (k) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
 const file = args.find((a, i) => !a.startsWith("--") && args[i - 1] !== "--pubkey" && args[i - 1] !== "--pubkey-url");
-if (!file) { console.error("usage: audit-verify.mjs [--record] <file.json> [--pubkey file.pem | --pubkey-url url | --no-sig]"); process.exit(1); }
+if (!file) { console.error("usage: audit-verify.mjs [--record|--disclosure] <file.json> [--pubkey file.pem | --pubkey-url url | --no-sig]"); process.exit(1); }
 let doc = JSON.parse(readFileSync(file, "utf8"));
 if (doc.content?.[0]?.text) doc = JSON.parse(doc.content[0].text); // raw MCP tool result
+
+// ---- disclosure fact sheets (disclose_contract / GET /c/:id/disclosure.json) ----
+// The signature covers the Merkle ROOT, not the fact list: recompute each fact's salted leaf, walk its proof to the
+// root, then verify the signature over the signed body. A SUBSET of the original facts verifies identically — that
+// is the point — so "OK" here means "every fact present is genuine", never "these are all the facts there were".
+if (args.includes("--disclosure") || doc.signed?.body?.format === "agentchan-disclosure-v1") {
+  const canonD = (v) => v === null || v === undefined || typeof v !== "object" ? JSON.stringify(v === undefined ? null : v) : Array.isArray(v) ? "[" + v.map((x) => (x === undefined ? "null" : canonD(x))).join(",") + "]" : "{" + Object.keys(v).filter((k) => v[k] !== undefined).sort().map((k) => JSON.stringify(k) + ":" + canonD(v[k])).join(",") + "}";
+  const H = (s) => createHash("sha256").update(s, "utf8").digest("hex");
+  const w = doc, root = w.signed?.body?.merkle?.root;
+  let bad = 0;
+  if (!root || !Array.isArray(w.facts)) { console.error("not a disclosure file: expected { signed: { body: { merkle: { root } } }, facts: [...] }"); process.exit(1); }
+  for (const f of w.facts) {
+    let h = H("acdf1|" + canonD({ k: f.k, v: f.v }) + "|" + f.salt);
+    for (const st of f.proof || []) h = st.side === "right" ? H(h + "|" + st.h) : H(st.h + "|" + h);
+    if (h !== root) { bad++; console.log("FACT FAIL: '" + f.k + "' does not prove to the signed root"); }
+  }
+  console.log((bad ? "FACTS FAIL" : "facts ok") + ": " + w.facts.length + " fact(s) checked against root " + root.slice(0, 16) + "… (a subset of the original sheet verifies the same; absence of a fact proves nothing)");
+  const digest = createHash("sha256").update(canonD(w.signed.body)).digest("hex");
+  if (digest !== w.signed.digest_sha256) { bad++; console.log("DIGEST MISMATCH: signed body altered"); }
+  else if (!w.signed.signature) console.log("digest ok; no signature (server had no signing key)");
+  else if (args.includes("--no-sig")) console.log("signature check skipped (--no-sig)");
+  else {
+    let pem = null, from = "";
+    if (opt("--pubkey")) { pem = readFileSync(opt("--pubkey"), "utf8"); from = opt("--pubkey"); }
+    else {
+      const url = opt("--pubkey-url") || ((w.signed.body.server || "https://channel.amkentech.com").replace(/\/$/, "") + "/.well-known/agentchan-signing-key.json");
+      try { const j = await (await fetch(url, { signal: AbortSignal.timeout(10000) })).json(); pem = j.public_key_pem; from = url + " (kid " + j.kid + ")"; } catch (e) { console.log("could not fetch the public key (" + e.message + "); pass --pubkey <pem> or --no-sig"); }
+    }
+    if (pem) {
+      const ok = edVerify(null, Buffer.from(digest, "hex"), createPublicKey(pem), Buffer.from(w.signed.signature.sig, "base64url"));
+      if (!ok) bad++;
+      console.log((ok ? "signature ok" : "SIGNATURE FAIL") + ": Ed25519 " + w.signed.signature.kid + " signed " + w.signed.signature.signed_at + ", key from " + from);
+    }
+  }
+  console.log(bad ? "FAIL: " + bad + " problem(s)" : "OK");
+  process.exit(bad ? 2 : 0);
+}
 if (doc.record && doc.digest_sha256 === undefined && doc.signature) doc = { body: doc.record, digest_sha256: doc.digest_sha256, signature: doc.signature }; // export_contract tool output
 const wrapped = doc.body ? doc : null;            // signed wrapper { body, digest_sha256, signature }
 const body = wrapped ? wrapped.body : doc;

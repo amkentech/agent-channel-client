@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // agent-channel <command> ...   the client, one entry point.
-//   join <invite_code> <handle> "<Name>" [--runtime claude|codex|both] [--email you@x.com]
+//   init                                               detect every agent CLI, register into each, verify
+//   join <invite_code> <handle> "<Name>" [--runtime claude|codex|all] [--email you@x.com]
+//   signin <handle> [--runtime ...]                    existing identity, new machine/runtime (emailed code, no invite)
 //   wire [--runtime ...] [--dry-run] [--oauth]        wire hooks / MCP / listener for an existing token
 //   doctor                                             check everything for this machine
 //   listen [--runtime claude|codex]                    run the resident listener in the foreground
@@ -16,7 +18,7 @@ import { dirname, join, resolve } from "node:path";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const [cmd, ...rest] = process.argv.slice(2);
 const map = {
-  join: ["scripts/setup.mjs", "join"], wire: ["scripts/setup.mjs", "wire"], doctor: ["scripts/setup.mjs", "doctor"],
+  init: ["scripts/setup.mjs", "init"], join: ["scripts/setup.mjs", "join"], signin: ["scripts/setup.mjs", "signin"], wire: ["scripts/setup.mjs", "wire"], doctor: ["scripts/setup.mjs", "doctor"],
   listen: ["scripts/listen.mjs"], send: ["scripts/artifact.mjs", "send"], fetch: ["scripts/artifact.mjs", "fetch"], keygen: ["scripts/artifact.mjs", "keygen"],
   rotate: ["scripts/artifact.mjs", "rotate"], "revoke-key": ["scripts/artifact.mjs", "revoke-key"], keys: ["scripts/artifact.mjs", "keys"],
   share: ["scripts/share.mjs"], publish: ["scripts/publish.mjs"], open: ["scripts/open-link.mjs"], "export-conversation": ["scripts/export-conversation.mjs"], call: ["scripts/cli.mjs"], verify: ["scripts/verify.mjs"],
@@ -25,8 +27,10 @@ const map = {
 if (!cmd || !map[cmd]) {
   console.log(`agent-channel <command>
 
-  join <invite_code> <handle> "<Name>" [--runtime claude|codex|both] [--email you@x.com]
-  wire [--runtime claude|codex|desktop] [--dry-run] [--oauth]
+  init                                            detect every agent CLI on this machine, register into each, verify
+  join <invite_code> <handle> "<Name>" [--runtime claude|codex|all] [--email you@x.com]
+  signin <handle> [--runtime ...]                 existing identity, new machine or runtime: code to your verified email
+  wire [--runtime claude|codex|desktop|cursor|gemini|windsurf|all] [--dry-run] [--oauth]
   doctor
   listen [--runtime claude|codex]
   send @handle <path> [--note text]

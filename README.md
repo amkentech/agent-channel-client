@@ -2,14 +2,30 @@
 
 This is the client (hooks, listener, setup, share, send). The server is a separate private service.
 
-Send your Claude Code or Codex session, or a file, to another person in one typed line. Encrypted on your machine. They read it with nothing installed.
+One identity for every AI coding session you run. Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf: register once, they all act as you, and they share one inbox.
+
+It is useful before you connect a single other person:
+
+```
+npx @amkentech/agent-channel join <invite_code> <handle> "Your Name"   # registers into every agent CLI it detects
+```
+
+Then, sitting in Claude Code, say **"hand this to codex: run the failing integration test and fix the flake."** The task lands in your own inbox flagged for the Codex session: that terminal's statusline shows `⇄ handoff for this session`, its next prompt surfaces the brief in full, and its agent gets on with it. Nothing re-typed, nothing pasted between windows. Read a message in one CLI and the others say "read on Codex CLI" instead of showing a gap; a handoff addressed to another runtime is listed but never consumed by the wrong one.
+
+Handing work to another person runs on the same inbox, hooks, and record. That is the point of starting solo: by the time there is a second human, the machinery is already part of how you work.
+
+## Share a file or this session, with someone who has nothing installed
 
 ```
 npx @amkentech/agent-channel share ./notes.md                 # prints a link; no account, no invite
 npx @amkentech/agent-channel share --conversation --last 40   # this session's transcript, redacted, as a link
 ```
 
-Inside Claude Code, once you have joined (invite code from a member):
+Encrypted on your machine; the key rides after `#` in the link and never reaches the server. They read it in a browser.
+
+## When there is a second person
+
+Inside Claude Code, once you are both on the channel:
 
 ```
 @sam send-conversation --last 40 the auth thread   # typed as a prompt: a hook sends it, the model never sees it
@@ -17,7 +33,9 @@ Inside Claude Code, once you have joined (invite code from a member):
 @sam are you around?                               # a human message, no model turn
 ```
 
-Sam's agent reads what arrives as data and triages it for Sam. If Sam opens a link in a browser instead, there is a box to send a note back, and the same `npx` line to send one of their own.
+Sam's agent reads what arrives as data and triages it for Sam. If Sam opens a link in a browser instead, there is a box to send a note back, and the same `npx` line to send one of their own. When there is real work to hand over, both humans approve a written contract in their own words, and every authorization lands in a signed, hash-chained record.
+
+## Publish a living document
 
 For an artifact a whole team keeps asking for, publish it at a stable address instead of resending links (needs an account; a `share` link is a frozen snapshot, a doc is a living one):
 
@@ -34,11 +52,20 @@ Readers bookmark one URL; every publish updates what it shows, old versions stay
 Node 22+. Sharing needs nothing else. To join the channel (messages, files into an inbox, contracts):
 
 ```
-npx @amkentech/agent-channel join <invite_code> <handle> "Your Name"        # --runtime codex for Codex CLI; both works
+npx @amkentech/agent-channel join <invite_code> <handle> "Your Name"   # registers into EVERY agent CLI it detects
 npx @amkentech/agent-channel doctor
 ```
 
-`join` registers the MCP server in your client and merges two hooks into its config (`SessionStart`, `UserPromptSubmit`); it prints what it wrote. Restart the client. claude.ai, Claude Desktop, ChatGPT and Codex cloud connect by URL instead: see [/docs](https://channel.amkentech.com/docs).
+One identity, every runtime. `join` detects the agent CLIs on your machine — Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf — and registers the MCP server into each (plus hooks where the client has them: `SessionStart`, `UserPromptSubmit`); it prints what it wrote. Restart the clients. Messages are addressed to *you*, not to a CLI: whichever one you sit in reads the same inbox. `--runtime codex` (or any one name) narrows it.
+
+Already on the channel and setting up a second machine or a new CLI? Don't join again — sign in, and the same handle extends:
+
+```
+npx @amkentech/agent-channel signin <your-handle>     # a 6-digit code goes to your verified email; no invite needed
+npx @amkentech/agent-channel init                     # any time later: detect, register, verify in one command
+```
+
+claude.ai, ChatGPT and Codex cloud connect by URL instead: see [/docs](https://channel.amkentech.com/docs).
 
 Lost? `npx @amkentech/agent-channel guide` lists what the channel can do, by job; `guide publish` (or any topic) walks one through. The same guide is at [/guide](https://channel.amkentech.com/guide), and your agent can pull it with the `guide` tool when you ask "how do I…".
 

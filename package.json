@@ -1,7 +1,7 @@
 {
   "name": "@amkentech/agent-channel",
-  "version": "0.7.2",
-  "description": "Send your Claude Code or Codex session, or a file, to another person in one line: encrypted read-only links (no account), or into a teammate's inbox via hooks + a remote MCP server. The server is a separate, private service.",
+  "version": "0.8.0",
+  "description": "One identity for every AI coding session you run: Claude Code, Codex, Desktop, Cursor, Gemini, Windsurf share one inbox, hand tasks to each other, and message other people's agents. Encrypted files and read-only share links included. The server is a separate, private service.",
   "type": "module",
   "bin": {
     "agent-channel": "bin/agent-channel.mjs"

@@ -1,8 +1,15 @@
 #!/usr/bin/env node
 // One-command onboarding and health check for a person joining Agent Channel.
 //
-//   node scripts/setup.mjs join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|both] [--email you@x.com]
-//        -> creates your identity + one agent token per runtime, connected to whoever invited you, then wires everything below
+//   node scripts/setup.mjs join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|all] [--email you@x.com]
+//        -> creates your identity + one agent token per DETECTED runtime (Claude Code, Codex, Desktop, Cursor, Gemini,
+//           Windsurf), connected to whoever invited you, then wires everything below
+//   node scripts/setup.mjs signin <handle> [--runtime ...]
+//        -> you already exist; a NEW MACHINE or runtime gets its own token via a code emailed to your verified address.
+//           One identity, many runtimes: never a second handle.
+//   node scripts/setup.mjs init
+//        -> the one command: token on this machine? detect every agent CLI, register into each, verify. No token? it
+//           says which of join/signin applies.
 //   node scripts/setup.mjs wire [--runtime claude|codex] [--token ac_...]
 //        -> MCP server in the client, hooks (type-to-send, waiting banner, status), token storage, listener at logon, listener now
 //   node scripts/setup.mjs doctor
@@ -62,14 +69,16 @@ function runtimesWanted() {
   if (r === "all") return [ADAPTERS.claude, ADAPTERS.codex, ADAPTERS["claude-desktop"], ADAPTERS.cursor, ADAPTERS.gemini, ADAPTERS.windsurf].filter((a) => a.detect());
   if (r === "desktop" || r === "claude-desktop") return [ADAPTERS["claude-desktop"]];
   if (r) return [adapterFor(r)];
-  const found = [ADAPTERS.claude, ADAPTERS.codex].filter((a) => a.detect());
+  // Default = every client detected on this machine. The person is one identity; the sender never needs to know which
+  // CLI they sit in, so setup should land in all of them, not make the human enumerate.
+  const found = Object.values(ADAPTERS).filter((a) => a.key !== "generic" && a.detect());
   return found.length ? found : [ADAPTERS.claude];
 }
 
 // ---------------- join ----------------
 async function join_() {
   const [code, handle, display_name] = args.slice(1).filter((x, i, arr) => !x.startsWith("--") && arr[i - 1] !== "--runtime" && arr[i - 1] !== "--email");
-  if (!code || !handle || !display_name) { say('usage: setup.mjs join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|both] [--email you@x.com]'); process.exit(1); }
+  if (!code || !handle || !display_name) { say('usage: setup.mjs join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|all] [--email you@x.com]   (default: every detected client)'); process.exit(1); }
   const ads = runtimesWanted();
   const first = ads[0];
   say("Joining Agent Channel as @" + handle.replace(/^@/, "") + " (" + ads.map((a) => a.label).join(" + ") + ")...");
@@ -85,6 +94,64 @@ async function join_() {
   say("");
   say("Done. Open " + ads.map((a) => a.label).join(" or ") + " and type:   @" + j.connected_to.replace(/^@/, "") + " hi, I'm in.");
   say("Then run  node scripts/setup.mjs doctor  any time.");
+}
+
+// ---------------- signin: this person already exists; a new machine or runtime gets its own token ----------------
+// The server side is /signin/start + /signin/finish (src/oauth.js): handle -> 6-digit code to the VERIFIED email ->
+// agent token, the same hardened flow as the OAuth consent page. This is the path that prevents the second-handle
+// mistake: an existing identity extends to a new machine instead of joining again as someone else.
+async function signin_() {
+  const positional = args.slice(1).filter((x, i, arr) => !x.startsWith("--") && arr[i - 1] !== "--runtime" && arr[i - 1] !== "--token");
+  const handle = (positional[0] || "").replace(/^@/, "").toLowerCase();
+  if (!handle) { say("usage: setup.mjs signin <handle> [--runtime claude|codex|all]   (a code goes to the email you verified with verify_email)"); process.exit(1); }
+  const ads = runtimesWanted();
+  const first = ads[0];
+  const { randomBytes } = await import("node:crypto");
+  const clientLabel = ("The Agent Channel CLI on " + (await import("node:os")).hostname()).slice(0, 80);
+  const nonce = randomBytes(24).toString("base64url");
+  say("Signing in as @" + handle + " (" + ads.map((a) => a.label).join(" + ") + ")...");
+  let st = await api("/signin/start", { handle, nonce, client: clientLabel, runtime: first.runtime });
+  say("  " + st.message);
+  const rl = (await import("node:readline/promises")).createInterface({ input: process.stdin, output: process.stdout });
+  let fin = null;
+  for (;;) {
+    const a = (await rl.question("  Code from the email (or r = send a new one): ")).trim();
+    if (!a) continue;
+    if (/^r$/i.test(a)) { st = await api("/signin/start", { handle, nonce, client: clientLabel, runtime: first.runtime, resend: true }); say("  " + st.message); continue; }
+    const r = await fetch(BASE + "/signin/finish", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ handle, nonce, ticket: st.ticket, code: a, runtime: first.runtime, agent_name: first.key, client: clientLabel }), signal: AbortSignal.timeout(15000) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.token) { fin = j; break; }
+    say("  " + (j.error || "error " + r.status));
+    if (j.reset) { rl.close(); say("Start over:  node scripts/setup.mjs signin " + handle); process.exit(1); }
+  }
+  rl.close();
+  saveTok(first.key, { handle: fin.handle.replace(/^@/, ""), agent_id: fin.agent_id, runtime: first.runtime, token: fin.token, base: BASE });
+  say("Welcome back, @" + fin.handle.replace(/^@/, "") + ". Token for " + first.label + " saved to " + tokFile(first.key) + " (shown nowhere else).");
+  for (const ad of ads.slice(1)) {
+    if (readTok(ad.key)?.token) { say(ad.label + " already has a token on this machine; keeping it."); continue; }
+    const a2 = await api("/agents", { name: ad.key, runtime: ad.runtime }, fin.token);
+    saveTok(ad.key, { handle: fin.handle.replace(/^@/, ""), agent_id: a2.id, runtime: ad.runtime, token: a2.token, base: BASE });
+    say("Agent for " + ad.label + " minted and saved to " + tokFile(ad.key) + ".");
+  }
+  if (!args.includes("--no-wire")) for (const ad of ads) await wire(ad, tokenFor(ad));
+  say("");
+  say("Done. Run  node scripts/setup.mjs doctor  any time.");
+}
+
+// ---------------- init: detect, register, verify — the one command ----------------
+async function init_() {
+  const seeded = Object.values(ADAPTERS).some((a) => a.key !== "generic" && readTok(a.key)?.token) || process.env.AGENTCHAN_TOKEN;
+  if (!seeded) {
+    say("No Agent Channel token on this machine yet. Two ways in:");
+    say("  already have a handle?   node scripts/setup.mjs signin <your-handle>        (a code goes to your verified email)");
+    say('  new here?                node scripts/setup.mjs join <invite_code> <handle> "<Your Name>"');
+    process.exit(1);
+  }
+  const ads = runtimesWanted();
+  say("Detected: " + ads.map((a) => a.label).join(", "));
+  for (const ad of ads) await wire(ad, opt("--token") || tokenFor(ad));
+  say("");
+  await doctor();
 }
 
 // ---------------- wire ----------------
@@ -203,13 +270,13 @@ function listenerFresh(ad) {
 async function doctor() {
   say("Agent Channel doctor  (server " + BASE + ")");
   try { const h = await api("/health"); ok("server reachable, listeners connected: " + h.listeners); } catch (e) { bad("server unreachable: " + e.message); }
-  const ads = [ADAPTERS.claude, ADAPTERS.codex, ADAPTERS["claude-desktop"]].filter((a) => a.detect());
-  if (!ads.length) warn("no Claude Code, Codex, or Claude Desktop install detected");
+  const ads = Object.values(ADAPTERS).filter((a) => a.key !== "generic" && a.detect());
+  if (!ads.length) warn("no agent CLI detected (Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf)");
   for (const ad of ads) {
     say("");
     say(ad.label + ":");
     const token = tokenFor(ad);
-    if (!token) { bad("no token (" + ad.tokenEnv + " or " + tokFile(ad.key) + "). Join with an invite: setup.mjs join <code> <handle> \"<Name>\" --runtime " + ad.key); continue; }
+    if (!token) { bad("no token (" + ad.tokenEnv + " or " + tokFile(ad.key) + "). Already have a handle: setup.mjs signin <handle> --runtime " + ad.key + ". New: setup.mjs join <code> <handle> \"<Name>\" --runtime " + ad.key); continue; }
     let me = null;
     try { me = await api("/peek", null, token); ok("token valid, you are @" + me.handle + " (" + (me.unread_messages + me.proposals_awaiting_you + me.artifacts_waiting) + " waiting)"); }
     catch (e) { bad("token rejected: " + e.message + (e.cause ? " (" + (e.cause.code || e.cause.message) + ")" : "")); }
@@ -270,6 +337,8 @@ async function doctor() {
 }
 
 if (cmd === "join") await join_();
+else if (cmd === "signin") await signin_();
+else if (cmd === "init") await init_();
 else if (cmd === "wire") { const ads = runtimesWanted(); for (const ad of ads) await wire(ad, opt("--token") || tokenFor(ad)); }
 else if (cmd === "doctor" || cmd === "status") await doctor();
-else { say("usage: setup.mjs join <inv_code> <handle> \"<Display Name>\" [--runtime claude|codex|both] [--email x]\n       setup.mjs wire [--runtime claude|codex|desktop|both|all] [--token ac_...] [--oauth] [--dry-run]\n       setup.mjs doctor"); process.exit(1); }
+else { say("usage: setup.mjs join <inv_code> <handle> \"<Display Name>\" [--runtime claude|codex|all] [--email x]\n       setup.mjs signin <handle> [--runtime ...]        existing identity, new machine or runtime\n       setup.mjs init                                     detect every agent CLI, register into each, verify\n       setup.mjs wire [--runtime claude|codex|desktop|all] [--token ac_...] [--oauth] [--dry-run]\n       setup.mjs doctor"); process.exit(1); }
