@@ -15,7 +15,7 @@ import { readFileSync, statSync, writeFileSync, mkdirSync, existsSync, readdirSy
 import { basename, join, resolve, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { encryptFor, ensureKey, sha256hex, generateKeypair, findLocalKey, saveLocalKey } from "../lib/crypto.mjs";
+import { encryptFor, ensureKey, sha256hex, generateKeypair, findLocalKey, saveLocalKey, decryptWith, loadLocalKeys } from "../lib/crypto.mjs";
 import { fetchArtifact } from "../lib/artifacts.mjs";
 
 const args = process.argv.slice(2);
@@ -109,6 +109,37 @@ try {
     } else {
       await fetchArtifact({ base: BASE, token, handle: me.handle, id: args[1] });
     }
+  } else if (cmd === "org-keygen") {
+    // Enterprise custody: the ORG key is generated here, on the claimant's machine, and only the PUBLIC half is ever
+    // registered (set_org_escrow). key_id is deterministic from the domain so envelopes and this key store agree.
+    const me = await myHandle();
+    const domain = (flag("--domain") || "").toLowerCase();
+    if (!domain) { console.error("usage: artifact.mjs org-keygen --domain <your-verified-org-domain>"); process.exit(1); }
+    const label = "org-escrow-" + domain;
+    if (findLocalKey(me.handle, label) && !has("--force")) { console.error("an org key for " + domain + " already exists locally (" + label + "). --force replaces it; the old one stays on disk renamed only if you rename it yourself."); process.exit(1); }
+    const k = generateKeypair();
+    saveLocalKey(me.handle, label, { key_id: label, ...k });
+    console.log("org escrow keypair for " + domain + " generated. Private key stays in ~/.agentchan/" + me.handle + "/keys/ (0600). BACK IT UP: without it, escrowed files are unreadable to the org.");
+    console.log("register the public half (your agent runs set_org_escrow):\n  public_key: " + k.public_key);
+  } else if (cmd === "org-list") {
+    const r = await api("/org/artifacts");
+    if (!r.artifacts.length) { console.log("no live artifacts among " + r.org + " members"); }
+    for (const a of r.artifacts) console.log(a.id + "  " + a.from_handle + " -> " + a.to_handle + "  " + a.filename + " (" + a.size_bytes + " B)  expires " + a.expires_at);
+    if (r.artifacts.length) console.log("\nFetch one: node scripts/artifact.mjs org-fetch <id>   (the member is notified; the fetch is on the ledger)");
+  } else if (cmd === "org-fetch") {
+    const me = await myHandle();
+    if (!args[1]) { console.error("usage: artifact.mjs org-fetch <artifact_id>"); process.exit(1); }
+    const a = await api("/org/artifacts/" + args[1]);
+    const plain = decryptWith(loadLocalKeys(me.handle), a.envelope, a.ciphertext);
+    const { inspectArtifact, safeName } = await import("../lib/inspect.mjs");
+    const report = inspectArtifact({ filename: a.filename, bytes: plain, declaredSha256: a.sha256, actualSha256: sha256hex(plain) });
+    const dir = join(homedir(), ".agentchan", me.handle, "org-audit", String(args[1]).slice(0, 8));
+    mkdirSync(dir, { recursive: true });
+    const out = join(dir, safeName(a.filename));
+    writeFileSync(out, plain);
+    writeFileSync(join(dir, "report.json"), JSON.stringify({ ...report, from: a.from, to: a.to, fetched_by: "@" + me.handle, org_escrow: true }, null, 2));
+    console.log("decrypted " + a.filename + " (" + a.from + " -> " + a.to + ") to " + out + "  [" + report.verdict + "]");
+    console.log("the member was notified of this fetch, and it is on the audit ledger.");
   } else if (cmd === "keygen") {
     const me = await myHandle();
     const label = flag("--label") || (me.agent + "-" + me.runtime + "-" + (process.env.COMPUTERNAME || process.env.HOSTNAME || "host")).toLowerCase();
