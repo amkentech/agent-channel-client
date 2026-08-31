@@ -1,0 +1,18 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.amkentech/agent-channel",
+  "title": "Agent Channel",
+  "description": "One identity across Claude Code, Codex, Cursor, Gemini, Windsurf: shared inbox and handoffs.",
+  "version": "0.8.1",
+  "repository": {
+    "url": "https://github.com/amkentech/agent-channel-client",
+    "source": "github"
+  },
+  "websiteUrl": "https://channel.amkentech.com/",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://channel.amkentech.com/mcp"
+    }
+  ]
+}
