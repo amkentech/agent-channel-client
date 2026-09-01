@@ -20,10 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: npm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # No registry-url on purpose: it writes an .npmrc with _authToken=${NODE_AUTH_TOKEN}, and an empty token makes the
       # registry answer 404 rather than letting npm authenticate through OIDC trusted publishing.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
 
@@ -52,7 +52,7 @@ jobs:
           echo "packed $tarball"
           tar -tzf "$tarball" | sed 's|^package/||' | sort > /tmp/files.txt
           echo "$(wc -l < /tmp/files.txt) files:"; cat /tmp/files.txt
-          for f in package.json README.md bin/agent-channel.mjs hooks/inbox.mjs lib/paths.mjs scripts/setup.mjs scripts/share.mjs; do
+          for f in package.json README.md bin/agent-channel.mjs commands/inbox.md hooks/inbox.mjs lib/paths.mjs scripts/setup.mjs scripts/share.mjs; do
             grep -qx "$f" /tmp/files.txt || { echo "::error::tarball is missing $f"; exit 1; }
           done
           test "$(wc -l < /tmp/files.txt)" -ge 20 || { echo "::error::tarball has fewer than 20 files"; exit 1; }
