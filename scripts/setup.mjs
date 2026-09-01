@@ -509,11 +509,19 @@ function listenerFresh(ad) {
 async function doctor() {
   say("Agent Channel doctor  (server " + BASE + ")");
   try { const h = await api("/health"); ok("server reachable, listeners connected: " + h.listeners); } catch (e) { bad("server unreachable: " + e.message); }
-  const ads = Object.values(ADAPTERS).filter((a) => a.key !== "generic" && a.detect());
-  if (!ads.length) warn("no agent CLI detected (Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf, Grok CLI)");
+  // A stored credential is checkable whether or not its CLI is. Gating every check on detect() made doctor
+  // blind to the thing it exists to find: a live token on a machine where the client is not detectable (not
+  // on PATH, or not installed at all -- on the CI runner three doctor tests failed for exactly this reason:
+  // the loop below never ran). So a runtime with a token in the store is checked even when its CLI is not
+  // found; only the wiring, hook, and listener checks -- which need the client itself -- are skipped, out loud.
+  const all = Object.values(ADAPTERS).filter((a) => a.key !== "generic");
+  const detected = new Set(all.filter((a) => a.detect()));
+  if (!detected.size) warn("no agent CLI detected (Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf, Grok CLI)");
+  const ads = all.filter((a) => detected.has(a) || readTok(a.key)?.token);
   for (const ad of ads) {
     say("");
     say(ad.label + ":");
+    if (!detected.has(ad)) warn("client CLI not detected, but " + tokFile(ad.key) + " holds a credential -- checking the token");
     const token = tokenFor(ad);
     if (!token) { bad("no token (" + ad.tokenEnv + " or " + tokFile(ad.key) + "). Already have a handle: npx @amkentech/agent-channel signin <handle> --runtime " + ad.key + ". New: npx @amkentech/agent-channel join <code> <handle> \"<Name>\" --runtime " + ad.key); continue; }
     let me = null;
@@ -544,6 +552,7 @@ async function doctor() {
     if (id.state === "ok" && id.runtime !== ad.runtime) bad("this token is a '" + id.runtime + "' agent, not '" + ad.runtime + "'. It reads and can ACK that runtime's mail. Fix: npx @amkentech/agent-channel wire --runtime " + ad.key);
     else if (id.state === "ok") ok("token is this runtime's own agent (" + id.runtime + ")");
     else if (id.state === "unknown") warn("could not verify which agent this token is (" + id.why + ")");
+    if (!detected.has(ad)) { warn("wiring, hook, and listener checks skipped (client CLI not found on this machine)"); continue; }
     // Display placeholder, never the credential: this command is PRINTED (into a terminal that is often an
     // agent's tool output), and check()/auth() read the client's config, not the token argument. The dry-run
     // path made the same substitution for the same reason.

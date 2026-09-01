@@ -64,6 +64,7 @@ CREATE OR REPLACE FUNCTION public.agentchan_housekeep()
  RETURNS void
  LANGUAGE sql
  SECURITY DEFINER
+ SET search_path = pg_catalog, public
 AS $function$
   update public.agentchan_proposals set status='expired', updated_at=now() where status in ('pending','countered','draft') and expires_at < now();
   delete from public.agentchan_messages m where m.expires_at < now()
@@ -71,10 +72,21 @@ AS $function$
   delete from public.agentchan_artifacts a where a.expires_at < now()
     and (a.proposal_id is null or not exists (select 1 from public.agentchan_proposals p where p.id = a.proposal_id and p.status in ('draft','pending','countered','accepted','returned')));
   delete from public.agentchan_links where expires_at < now() - interval '1 day' or (revoked_at is not null and revoked_at < now() - interval '1 day');
+  delete from public.agentchan_docs d where (d.revoked_at is not null and d.revoked_at < now() - interval '1 day')
+    or (d.created_at < now() - interval '1 day' and not exists (select 1 from public.agentchan_links l where l.doc_id = d.id));
   delete from public.agentchan_invites where expires_at < now() and used_at is null;
   delete from public.agentchan_verifications where expires_at < now() - interval '1 day';
   delete from public.agentchan_oauth_codes where expires_at < now() - interval '1 hour';
   delete from public.agentchan_oauth_tokens where (revoked_at is not null and revoked_at < now() - interval '7 days') or (coalesce(refresh_expires_at, expires_at) < now() - interval '7 days');
+  delete from public.agentchan_agents a where a.person_id in (
+    select p.id from public.agentchan_people p
+     where p.kind = 'anon' and p.created_at < now() - interval '7 days'
+       and not exists (select 1 from public.agentchan_links l where l.person_id = p.id));
+  delete from public.agentchan_people p where p.kind = 'anon' and p.created_at < now() - interval '7 days'
+    and not exists (select 1 from public.agentchan_links l where l.person_id = p.id)
+    and not exists (select 1 from public.agentchan_agents a where a.person_id = p.id);
+  delete from public.agentchan_rate_limits where expires_at < now() - interval '1 hour';
+  delete from public.agentchan_bridge_deliveries where at < now() - interval '90 days';
 $function$;
 
 CREATE TRIGGER agentchan_audit_chain_trg BEFORE INSERT ON public.agentchan_audit FOR EACH ROW EXECUTE FUNCTION agentchan_audit_chain();
