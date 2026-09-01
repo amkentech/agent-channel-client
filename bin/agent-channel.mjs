@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // agent-channel <command> ...   the client, one entry point.
 //   init                                               detect every agent CLI, register into each, verify
-//   join <invite_code> <handle> "<Name>" [--runtime claude|codex|all] [--email you@x.com]
+//   join <invite_code> <handle> "<Name>" [--runtime claude|codex|grok|all] [--email you@x.com]
 //   signin <handle> [--runtime ...]                    existing identity, new machine/runtime (emailed code, no invite)
 //   wire [--runtime ...] [--dry-run] [--oauth]        wire hooks / MCP / listener for an existing token
 //   doctor                                             check everything for this machine
@@ -9,8 +9,8 @@
 //   send @handle <path> [--note ...]                   send a file end-to-end encrypted
 //   share <path> | share --conversation [--last N] [--expires 72h] [--note ...]   make a read-only link (receiver installs nothing)
 //   export-conversation [--last N] [--out file]       redacted transcript of the current Claude Code / Codex session
-//   call <tool> '<json>'                              call any MCP tool (AGENTCHAN_TOKEN or saved token)
-//   verify <contract_id> ...                          run the exit gate checks for a return
+//   call <tool> '<json>' [--runtime <key>]            call any MCP tool as that runtime's own agent
+//   verify <contract_id> ... [--runtime <key>]        run the exit gate checks for a return
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -28,9 +28,9 @@ if (!cmd || !map[cmd]) {
   console.log(`agent-channel <command>
 
   init                                            detect every agent CLI on this machine, register into each, verify
-  join <invite_code> <handle> "<Name>" [--runtime claude|codex|all] [--email you@x.com]
+  join <invite_code> <handle> "<Name>" [--runtime claude|codex|grok|all] [--email you@x.com]
   signin <handle> [--runtime ...]                 existing identity, new machine or runtime: code to your verified email
-  wire [--runtime claude|codex|desktop|cursor|gemini|windsurf|all] [--dry-run] [--oauth]
+  wire [--runtime claude|codex|desktop|cursor|gemini|windsurf|grok|all] [--dry-run] [--oauth]
   doctor
   listen [--runtime claude|codex]
   send @handle <path> [--note text]
@@ -43,8 +43,8 @@ if (!cmd || !map[cmd]) {
   revoke-key <key_id> | --all                     lost device: revoke its key from any other machine of yours
   keys [@handle]                                  registered public keys with fingerprints
   export-conversation [--last N] [--out file]
-  call <tool> '<json args>'
-  verify <contract_id> ...
+  call <tool> '<json args>' [--runtime <key>]     any MCP tool, as that runtime's own agent (default claude)
+  verify <contract_id> ... [--runtime <key>]
   audit-verify [--record] <export.json>           offline: recheck a signed export's hashes, chain, signature
   guide [topic]                                   what this channel can do, by job (share, publish, handoff, teams, ...)
 
@@ -52,10 +52,11 @@ Server: ${process.env.AGENTCHAN_URL || "https://channel.amkentech.com"}   Tokens
   process.exit(cmd ? 1 : 0);
 }
 const [script, ...pre] = map[cmd];
-if (cmd === "call" && !process.env.AGENTCHAN_TOKEN) {
-  const { tokenFor } = await import("../lib/paths.mjs");
-  const t = tokenFor(rest.includes("--runtime") ? rest[rest.indexOf("--runtime") + 1] : "claude");
-  if (t) process.env.AGENTCHAN_TOKEN = t;
-}
+// No token resolution here any more. This used to resolve one for `call` and hand it to the child in
+// AGENTCHAN_TOKEN -- Claude Code's variable -- whatever runtime had been asked for, which is the same
+// borrowed-identity shape lib/paths.mjs exists to prevent; and it only did so when AGENTCHAN_TOKEN was UNSET,
+// so on a machine wired for Claude Code (the normal case) `call --runtime codex` fell straight through and ran
+// as claude-code. cli.mjs and verify.mjs now resolve their own token from the runtime they were given, so the
+// saved-token path this provided is still there, one layer down, and correct for every runtime.
 const child = spawn(process.execPath, [join(ROOT, script), ...pre, ...rest], { stdio: "inherit", env: process.env });
 child.on("exit", (c) => process.exit(c ?? 1));

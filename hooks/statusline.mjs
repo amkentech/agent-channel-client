@@ -8,6 +8,7 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { trustedPeek } from "../lib/peek-cache.mjs";
 
 const runtime = (process.argv[2] || "claude").toLowerCase();
 const root = join(homedir(), ".agentchan");
@@ -30,7 +31,10 @@ const base = (input.model?.display_name ? input.model.display_name : "") + (inpu
 if (!handle) { console.log(base); process.exit(0); }
 
 let peek = null;
-try { peek = JSON.parse(readFileSync(join(root, handle, "peek.json"), "utf8")).peek; } catch {}
+// 2026-08-27: peek.json is one runtime's view (see lib/peek-cache.mjs) — only believe our own stamp. A
+// sibling-written file omits this runtime's handoffs and mislabels for_this_runtime, so a mismatch reads
+// as "no listener data", which is what the trailing "(listener?)" already means.
+try { peek = trustedPeek(JSON.parse(readFileSync(join(root, handle, "peek.json"), "utf8")), runtime); } catch {}
 const items = peek?.items || [];
 const humans = items.filter((i) => i.type === "human");
 const humanOnly = items.filter((i) => i.human_only && i.type !== "human");

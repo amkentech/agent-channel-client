@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 // One-command onboarding and health check for a person joining Agent Channel.
 //
-//   node scripts/setup.mjs join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|all] [--email you@x.com]
+//   node scripts/setup.mjs join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|grok|all] [--email you@x.com]
 //        -> creates your identity + one agent token per DETECTED runtime (Claude Code, Codex, Desktop, Cursor, Gemini,
-//           Windsurf), connected to whoever invited you, then wires everything below
+//           Windsurf, Grok), connected to whoever invited you, then wires everything below
 //   node scripts/setup.mjs signin <handle> [--runtime ...]
 //        -> you already exist; a NEW MACHINE or runtime gets its own token via a code emailed to your verified address.
 //           One identity, many runtimes: never a second handle.
 //   node scripts/setup.mjs init
 //        -> the one command: token on this machine? detect every agent CLI, register into each, verify. No token? it
 //           says which of join/signin applies.
-//   node scripts/setup.mjs wire [--runtime claude|codex] [--token ac_...]
+//   node scripts/setup.mjs wire [--runtime claude|codex|grok] [--token ac_...]
 //        -> MCP server in the client, hooks (type-to-send, waiting banner, status), token storage, listener at logon, listener now
 //   node scripts/setup.mjs doctor
 //        -> checks every piece and says exactly what is missing
@@ -22,9 +22,12 @@ import { homedir, platform } from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync, spawn } from "node:child_process";
 import { ADAPTERS, adapterFor, mergeHooks, which } from "../lib/adapters.mjs";
-import { readTok as readTokStore, saveTok as saveTokStore, tokFileHome, CLIENT_HOME, IN_NPX_CACHE, HOME_STORE } from "../lib/paths.mjs";
+import { readTok as readTokStore, saveTok as saveTokStore, tokFileHome, tokenEnvHint, refreshTokenEnv, CLIENT_HOME, IN_NPX_CACHE, HOME_STORE, RELOCATED } from "../lib/paths.mjs";
+import { readDiag, summarizeDiag } from "../lib/diag.mjs";
+import { summarizePushLog, configuredWs, wsHostPort, probe, probeLoadedThread, pushVerdict } from "../lib/codex-health.mjs";
 
 let REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+let DEPS_MISSING = false; // the listener's npm deps failed to install in CLIENT_HOME; step 7 must not write a startup entry that crash-loops
 // Running from an npx cache (npx @amkentech/agent-channel join ...)? That folder can vanish, and hooks/listener need a stable path:
 // copy this package to ~/.agentchan/client and run from there. A git checkout or a global install stays where it is.
 if (IN_NPX_CACHE && !process.env.AGENTCHAN_NO_SELF_INSTALL) {
@@ -32,7 +35,7 @@ if (IN_NPX_CACHE && !process.env.AGENTCHAN_NO_SELF_INSTALL) {
   cpSync(REPO, CLIENT_HOME, { recursive: true, force: true, filter: (src) => !/[\\/](\.git|\.tok\.[^\\/]+\.json|\.env[^\\/]*)$/.test(src) });
   // the listener needs the package's own deps (ws, MCP sdk); hooks need none. Install them once in the persistent copy.
   try { const { execFileSync: x } = await import("node:child_process"); x(platform() === "win32" ? "npm.cmd" : "npm", ["install", "--omit=dev", "--ignore-scripts", "--no-audit", "--no-fund", "--silent"], { cwd: CLIENT_HOME, stdio: "ignore", shell: platform() === "win32" }); }
-  catch { console.log("  note: could not npm install in " + CLIENT_HOME + "; run it there by hand before starting the listener"); }
+  catch { DEPS_MISSING = true; console.log("  problem: listener dependencies failed to install. Hooks and messaging still work, but the listener (toasts, incoming files) won't start.\n  fix:  cd " + CLIENT_HOME + " && npm install --omit=dev --ignore-scripts"); }
   console.log("  installed client to " + CLIENT_HOME + " (hooks and the listener run from there; re-run join/wire from any npx to update)");
   REPO = CLIENT_HOME;
 }
@@ -42,6 +45,14 @@ const cmd = args[0];
 const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
 const H = homedir();
 const WIN = platform() === "win32";
+
+/** Does this adapter's own hooksWire include the named hook script? doctor asks the adapter rather than keying on
+ *  a runtime name, so a runtime that gains a seam is reported the day its adapter gains it. Returns false rather
+ *  than throwing: doctor's job is to report, never to become the thing that fails. */
+const wiresHook = (ad, name) => {
+  try { return JSON.stringify(ad.hooksWire({ repo: REPO }).hooks || {}).includes("hooks/" + name); }
+  catch { return false; }
+};
 const say = (s) => console.log(s);
 const ok = (s) => say("  ok   " + s);
 const bad = (s) => say("  MISSING  " + s);
@@ -50,7 +61,33 @@ const warn = (s) => say("  note " + s);
 const tokFile = (key) => tokFileHome(key);            // tokens live in ~/.agentchan, not next to the code
 const readTok = (key) => readTokStore(key);
 const saveTok = (key, obj) => saveTokStore(key, obj);
-const tokenFor = (ad) => process.env[ad.tokenEnv] || readTok(ad.key)?.token || (ad.key === "claude-desktop" ? readTok("claude")?.token : null) || null;
+
+/** Every credential this runtime might legitimately be, in precedence order, each carrying WHERE it came from
+ *  and what handle that source claims.
+ *
+ *  This used to be a single expression: env var, else file. Only the first answer was ever consulted, which is
+ *  what made the mint loop. The `generic` adapter shared AGENTCHAN_TOKEN with Claude Code, so on a machine
+ *  wired for Claude Code `wire --runtime <unknown>` read Claude Code's token, correctly detected the mismatch,
+ *  minted an "other" agent, saved it to the file -- and the next run read the environment again and never
+ *  looked at the file it had just written. Four runs and the per-runtime cap of 4 is spent; after that wire is
+ *  a silent no-op. A LIST, tried in order, is what makes that terminate: once the file holds a correct token,
+ *  the wrong env var loses to it instead of triggering another mint. */
+function tokenCandidates(ad, explicit) {
+  const out = [];
+  const add = (token, from, handle) => {
+    if (token && !out.some((c) => c.token === token)) out.push({ token, from, handle: handle ? String(handle).replace(/^@/, "") : null });
+  };
+  add(explicit, "--token", null);
+  add(process.env[ad.tokenEnv], "the environment (" + ad.tokenEnv + ")", null);
+  const rec = readTok(ad.key);
+  add(rec?.token, rec?.file || tokFile(ad.key), rec?.handle);
+  // Claude Desktop predates having a join of its own; Claude Code's token was its documented fallback. It is
+  // still tried, but only as a CANDIDATE now: against a reachable server it is always a runtime mismatch, so
+  // what it really buys is a seed to mint Desktop its own agent with.
+  if (ad.key === "claude-desktop") { const c = readTok("claude"); add(c?.token, c?.file || tokFile("claude"), c?.handle); }
+  return out;
+}
+const tokenFor = (ad) => tokenCandidates(ad)[0]?.token || null;   // best guess, for doctor's read-only report
 
 async function api(path, body, token, retry = 1) {
   try { return await api1(path, body, token); }
@@ -66,7 +103,7 @@ async function api1(path, body, token) {
 function runtimesWanted() {
   const r = (opt("--runtime", "") || "").toLowerCase();
   if (r === "both") return [ADAPTERS.claude, ADAPTERS.codex];
-  if (r === "all") return [ADAPTERS.claude, ADAPTERS.codex, ADAPTERS["claude-desktop"], ADAPTERS.cursor, ADAPTERS.gemini, ADAPTERS.windsurf].filter((a) => a.detect());
+  if (r === "all") return Object.values(ADAPTERS).filter((a) => a.key !== "generic" && a.detect());
   if (r === "desktop" || r === "claude-desktop") return [ADAPTERS["claude-desktop"]];
   if (r) return [adapterFor(r)];
   // Default = every client detected on this machine. The person is one identity; the sender never needs to know which
@@ -78,7 +115,7 @@ function runtimesWanted() {
 // ---------------- join ----------------
 async function join_() {
   const [code, handle, display_name] = args.slice(1).filter((x, i, arr) => !x.startsWith("--") && arr[i - 1] !== "--runtime" && arr[i - 1] !== "--email");
-  if (!code || !handle || !display_name) { say('usage: setup.mjs join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|all] [--email you@x.com]   (default: every detected client)'); process.exit(1); }
+  if (!code || !handle || !display_name) { say('usage: npx @amkentech/agent-channel join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|grok|all] [--email you@x.com]   (default: every detected client)'); process.exit(1); }
   const ads = runtimesWanted();
   const first = ads[0];
   say("Joining Agent Channel as @" + handle.replace(/^@/, "") + " (" + ads.map((a) => a.label).join(" + ") + ")...");
@@ -90,10 +127,21 @@ async function join_() {
     saveTok(ad.key, { handle: j.handle.replace(/^@/, ""), agent_id: a2.id, runtime: ad.runtime, token: a2.token, base: BASE });
     say("Second agent for " + ad.label + " minted and saved to " + tokFile(ad.key) + ".");
   }
-  if (!args.includes("--no-wire")) for (const ad of ads) await wire(ad, tokenFor(ad));
+  if (!args.includes("--no-wire")) for (const ad of ads) await wire(ad);
   say("");
-  say("Done. Open " + ads.map((a) => a.label).join(" or ") + " and type:   @" + j.connected_to.replace(/^@/, "") + " hi, I'm in.");
-  say("Then run  node scripts/setup.mjs doctor  any time.");
+  say("Done. Last step, so you can see it working:");
+  for (const ad of ads) {
+    const cw = ad.commandsWire ? ad.commandsWire({ repo: REPO }) : null;
+    if (cw) {
+      say(ad.label + ":");
+      say("  1. close this terminal and open a new one (the token needs a fresh shell)");
+      say("  2. start " + ad.label);
+      say("  3. type " + cw.invokeAs("inbox.md") + " — your inbox appearing means everything is wired");
+    } else {
+      say(ad.label + ": open it and type:   @" + j.connected_to.replace(/^@/, "") + " hi, I'm in.");
+    }
+  }
+  say("Then run  npx @amkentech/agent-channel doctor  any time.");
 }
 
 // ---------------- signin: this person already exists; a new machine or runtime gets its own token ----------------
@@ -103,7 +151,7 @@ async function join_() {
 async function signin_() {
   const positional = args.slice(1).filter((x, i, arr) => !x.startsWith("--") && arr[i - 1] !== "--runtime" && arr[i - 1] !== "--token");
   const handle = (positional[0] || "").replace(/^@/, "").toLowerCase();
-  if (!handle) { say("usage: setup.mjs signin <handle> [--runtime claude|codex|all]   (a code goes to the email you verified with verify_email)"); process.exit(1); }
+  if (!handle) { say("usage: npx @amkentech/agent-channel signin <handle> [--runtime claude|codex|grok|all]   (a code goes to the email you verified with verify_email)"); process.exit(1); }
   const ads = runtimesWanted();
   const first = ads[0];
   const { randomBytes } = await import("node:crypto");
@@ -122,7 +170,7 @@ async function signin_() {
     const j = await r.json().catch(() => ({}));
     if (r.ok && j.token) { fin = j; break; }
     say("  " + (j.error || "error " + r.status));
-    if (j.reset) { rl.close(); say("Start over:  node scripts/setup.mjs signin " + handle); process.exit(1); }
+    if (j.reset) { rl.close(); say("Start over:  npx @amkentech/agent-channel signin " + handle); process.exit(1); }
   }
   rl.close();
   saveTok(first.key, { handle: fin.handle.replace(/^@/, ""), agent_id: fin.agent_id, runtime: first.runtime, token: fin.token, base: BASE });
@@ -133,9 +181,9 @@ async function signin_() {
     saveTok(ad.key, { handle: fin.handle.replace(/^@/, ""), agent_id: a2.id, runtime: ad.runtime, token: a2.token, base: BASE });
     say("Agent for " + ad.label + " minted and saved to " + tokFile(ad.key) + ".");
   }
-  if (!args.includes("--no-wire")) for (const ad of ads) await wire(ad, tokenFor(ad));
+  if (!args.includes("--no-wire")) for (const ad of ads) await wire(ad);
   say("");
-  say("Done. Run  node scripts/setup.mjs doctor  any time.");
+  say("Done. Run  npx @amkentech/agent-channel doctor  any time.");
 }
 
 // ---------------- init: detect, register, verify — the one command ----------------
@@ -143,50 +191,231 @@ async function init_() {
   const seeded = Object.values(ADAPTERS).some((a) => a.key !== "generic" && readTok(a.key)?.token) || process.env.AGENTCHAN_TOKEN;
   if (!seeded) {
     say("No Agent Channel token on this machine yet. Two ways in:");
-    say("  already have a handle?   node scripts/setup.mjs signin <your-handle>        (a code goes to your verified email)");
-    say('  new here?                node scripts/setup.mjs join <invite_code> <handle> "<Your Name>"');
+    say("  already have a handle?   npx @amkentech/agent-channel signin <your-handle>        (a code goes to your verified email)");
+    say('  new here?                npx @amkentech/agent-channel join <invite_code> <handle> "<Your Name>"');
     process.exit(1);
   }
   const ads = runtimesWanted();
   say("Detected: " + ads.map((a) => a.label).join(", "));
-  for (const ad of ads) await wire(ad, opt("--token") || tokenFor(ad));
+  for (const ad of ads) await wire(ad, opt("--token"));
   say("");
   await doctor();
 }
 
-// ---------------- wire ----------------
-async function wire(ad, token) {
-  if (!token) {
-    // no token for this runtime yet, but the person is already here under another: mint an agent for this runtime
-    const seed = readTok("claude")?.token || readTok("codex")?.token || process.env.AGENTCHAN_TOKEN || null;
-    if (seed && !args.includes("--dry-run")) {
-      try { const a2 = await api("/agents", { name: ad.key, runtime: ad.runtime }, seed); const h = readTok("claude")?.handle || readTok("codex")?.handle || null; saveTok(ad.key, { handle: h, agent_id: a2.id, runtime: ad.runtime, token: a2.token, base: BASE }); token = a2.token; ok(ad.label + ": minted its own agent (" + ad.runtime + ") for your handle"); }
-      catch (e) { bad(ad.label + ": could not mint an agent (" + e.message.slice(0, 120) + ")"); return; }
-    } else if (seed) { token = seed; }
-    else { bad(ad.label + ": no token. Pass --token or join first."); return; }
+// ---------------- who does a token actually belong to? ----------------
+//
+// A saved token is this runtime's token only if the SERVER agrees. Nothing used to check at all, and then the
+// check that was added had two answers where it needed three.
+//
+// The probe deliberately does NOT go through api(): api() throws on any non-2xx, which collapses "the server
+// says this token is dead" (401) into the same catch as "nobody answered". Those are opposite facts. It also
+// used a 15-second timeout, so one unreachable runtime stalled wire for 15s and `--runtime all` multiplied
+// that by every client on the machine.
+const PROBE_MS = Number(process.env.AGENTCHAN_PROBE_MS || 6000);
+
+async function probe1(path, token, ms) {
+  try {
+    const r = await fetch(BASE + path, { headers: { authorization: "Bearer " + token }, signal: AbortSignal.timeout(ms) });
+    let body = null; try { body = await r.json(); } catch {}
+    return { status: r.status, body };
+  } catch (e) {
+    const code = e?.cause?.code || e?.code;
+    return { status: 0, why: e?.name === "TimeoutError" ? "no answer in " + ms + "ms" : String(code || e?.message || e).slice(0, 90) };
   }
+}
+
+/** What the server says a token IS. Three answers, never two:
+ *    { state: "ok", runtime, handle, agent_id }  the server looked and told us
+ *    { state: "rejected", why }                  the server looked and says the token is dead (401/403)
+ *    { state: "unknown", why }                   nobody could tell us: unreachable, hung, older build, odd shape
+ *
+ *  "unknown" must NEVER be read as a mismatch. A server that is down, or one built before GET /agents flagged
+ *  the caller's own row with `this_one`, would otherwise re-mint an agent on every wire and spend the
+ *  per-runtime cap of 4 in four runs. That is why the this_one row is required rather than falling back to the
+ *  first row in the list -- `.find(a => a.this_one) || rows[0]` looks harmless, satisfies a source-text
+ *  assertion, and turns every older server into a permanent false mismatch.
+ *
+ *  It must equally never be read as VERIFIED, which is what it was: one try/catch returning null meant 401,
+ *  500, a 200 carrying an error body, an empty list, a missing this_one, a null runtime, a refused connection
+ *  and a 15-second hang all printed byte-for-byte what a verified-correct token printed. */
+async function identify(token, ms = PROBE_MS) {
+  const [ag, pk] = await Promise.all([probe1("/agents", token, ms), probe1("/peek", token, ms)]);
+  if (ag.status === 401 || ag.status === 403) return { state: "rejected", why: "HTTP " + ag.status + (ag.body?.error ? ", " + ag.body.error : "") };
+  if (ag.status === 0) return { state: "unknown", why: ag.why };
+  if (ag.status !== 200) return { state: "unknown", why: "HTTP " + ag.status + (ag.body?.error ? " " + String(ag.body.error).slice(0, 80) : "") };
+  const rows = ag.body?.agents;
+  if (!Array.isArray(rows)) return { state: "unknown", why: ag.body?.error ? "the server answered 200 with an error: " + String(ag.body.error).slice(0, 80) : "no agent list in the answer" };
+  if (!rows.length) return { state: "unknown", why: "the server listed no agents for this token" };
+  const mine = rows.find((a) => a && a.this_one);
+  if (!mine) return { state: "unknown", why: "this server does not say which agent the token is (no this_one; a build older than 2026-08)" };
+  if (!mine.runtime) return { state: "unknown", why: "the server did not say what runtime that agent is" };
+  // /peek is the only unauthenticated-by-handle route that names the person. Whose token this is matters as
+  // much as which runtime: a stranger's token with a matching runtime used to pass the check and be kept.
+  const handle = pk.status === 200 && typeof pk.body?.handle === "string" ? pk.body.handle.replace(/^@/, "") : null;
+  return { state: "ok", runtime: mine.runtime, agent_id: mine.id, handle };
+}
+
+/** Every handle the token store on this machine claims. "One identity, many runtimes" is the product's whole
+ *  premise, so tokens here are all supposed to be one person's. */
+function storedHandles() {
+  const s = new Set();
+  for (const k of Object.keys(ADAPTERS)) { const h = readTok(k)?.handle; if (h) s.add(String(h).replace(/^@/, "")); }
+  return s;
+}
+
+/** Is this token this person's at all? Unknown is not wrong (the server may not have said), but a token the
+ *  server attributes to somebody else is neither keepable NOR usable as a mint seed: minting with it would
+ *  create an agent under THEIR identity, on their cap, in their audit ledger. */
+function whoseToken(v, cand, known) {
+  if (!v.handle) return { ok: true };
+  if (cand.handle) return { ok: cand.handle === v.handle, expected: cand.handle };
+  if (known.size && !known.has(v.handle)) return { ok: false, expected: [...known].join("/") };
+  return { ok: true };
+}
+
+/** A credential of THIS person, good enough to mint a new agent with. Used only when this runtime has none. */
+async function findSeed(known) {
+  const cands = [];
+  const seen = new Set();
+  for (const k of Object.keys(ADAPTERS)) {
+    const r = readTok(k);
+    if (r?.token && !seen.has(r.token)) { seen.add(r.token); cands.push({ token: r.token, from: r.file || tokFile(k), handle: r.handle ? String(r.handle).replace(/^@/, "") : null }); }
+  }
+  const envTok = process.env.AGENTCHAN_TOKEN;
+  if (envTok && !seen.has(envTok)) cands.push({ token: envTok, from: "the environment (AGENTCHAN_TOKEN)", handle: null });
+  let unverified = null;
+  for (const c of cands) {
+    const v = await identify(c.token);
+    if (v.state === "rejected") continue;
+    if (v.state === "unknown") { unverified = unverified || { token: c.token, handle: c.handle }; continue; }
+    const who = whoseToken(v, c, known);
+    if (!who.ok) { warn("not minting with the token in " + c.from + ": the server says it is @" + v.handle + "'s, not @" + who.expected + "'s."); continue; }
+    // The handle comes from the SAME token that is about to do the minting. It used to be read out of
+    // readTok("claude") -- a different file from the token being used -- so a stale or foreign tok.claude.json
+    // wrote the wrong person's name onto a perfectly good new agent, and every later "is this mine?" question
+    // read that lie back.
+    return { token: c.token, handle: v.handle || c.handle };
+  }
+  return unverified;
+}
+
+// ---------------- wire ----------------
+let wiringIncomplete = false;
+
+async function wire(ad, explicitToken) {
+  const dry = args.includes("--dry-run");
   say("");
-  say("Wiring " + ad.label + ":");
-  if (args.includes("--dry-run")) {
-    const m = ad.mcpWire({ url: BASE, token: token ? token.slice(0, 6) + "..." : token }); const hw = ad.hooksWire({ repo: REPO });
-    say("  would: save token to " + tokFile(ad.key) + (WIN && ["claude", "codex"].includes(ad.key) ? " and setx " + ad.tokenEnv : ""));
+  say((dry ? "Would wire " : "Wiring ") + ad.label + ":");
+
+  // --- 0. which credential is this runtime's own identity?
+  // --dry-run runs this too. It used to skip the check entirely, which made the cautious preview the one mode
+  // that could not see the problem it would fix. Everything here is read-only: two GETs, no mint, no writes.
+  const known = storedHandles();
+  let chosen = null;      // { token, handle, agent_id, verified }
+  let seed = null;        // this person's, wrong runtime: mint material only
+  for (const c of tokenCandidates(ad, explicitToken)) {
+    const v = await identify(c.token);
+    if (v.state === "unknown") {
+      warn("could not verify this token against the server (" + v.why + "). Keeping it: an unreachable or older server is not evidence of a mismatch.");
+      chosen = { token: c.token, handle: c.handle, verified: false };
+      break;
+    }
+    if (v.state === "rejected") { bad("the token from " + c.from + " was rejected by the server (" + v.why + "). Not keeping it."); continue; }
+    const who = whoseToken(v, c, known);
+    if (!who.ok) { bad("the token from " + c.from + " belongs to @" + v.handle + ", not @" + who.expected + ". Not keeping it, and not minting with it."); continue; }
+    if (v.runtime !== ad.runtime) {
+      warn(ad.label + ": the saved token belongs to a '" + v.runtime + "' agent, not '" + ad.runtime + "'. "
+        + "Minting this runtime its own agent -- sharing one would let it consume the other's handoffs. (source: " + c.from + ")");
+      if (!seed) seed = { token: c.token, handle: v.handle || c.handle };
+      continue;
+    }
+    ok("token verified as this runtime's own agent (" + v.runtime + (v.handle ? ", @" + v.handle : "") + ")");
+    chosen = { token: c.token, handle: v.handle || c.handle, agent_id: v.agent_id, verified: true };
+    break;
+  }
+
+  // --- 1. no identity yet: mint one for this runtime, using another of this person's tokens
+  if (!chosen) {
+    if (!seed) seed = await findSeed(known);
+    if (!seed) bad("no token for " + ad.label + " and nothing to mint one with. New here: npx @amkentech/agent-channel join <code> <handle> \"<Name>\". Already have a handle: npx @amkentech/agent-channel signin <handle>.");
+    else if (dry) say("  would: mint a new '" + ad.runtime + "' agent" + (seed.handle ? " for @" + seed.handle : "") + " and save it to " + tokFile(ad.key));
+    else {
+      try {
+        const a2 = await api("/agents", { name: ad.key, runtime: ad.runtime }, seed.token);
+        // The record is written once, in step 3 below, from `chosen`. It used to be written here too, with the
+        // handle read out of readTok("claude") -- a DIFFERENT file from the token doing the minting -- so a
+        // stale or foreign tok.claude.json put the wrong person's name on a perfectly good new agent. Two
+        // writers of one field is how that survived; there is one now, and its handle comes from the server's
+        // answer for the seed token itself.
+        chosen = { token: a2.token, handle: seed.handle, agent_id: a2.id, verified: true };
+        ok("minted its own agent (" + ad.runtime + ")" + (seed.handle ? " for @" + seed.handle : ""));
+      } catch (e) {
+        // A failed mint used to `return` from here -- above the MCP registration, the hooks, the slash
+        // commands and the listener. A run that previously wired the client then wired NOTHING, said one
+        // line, and exited 0. Everything that does not need a token is still wired below; the exit code says
+        // the run did not finish the job.
+        bad("could not mint a '" + ad.runtime + "' agent: " + e.message.slice(0, 160));
+        warn("at the per-runtime cap? Ask your agent for  my_agents  and  revoke_agent <id>  on one you no longer use, then re-run this. Wiring the rest now; the MCP server needs a token and will be skipped.");
+      }
+    }
+  }
+  if (!chosen && !dry) wiringIncomplete = true;
+
+  // --- 2. dry run stops here, having said what it found and what it would do
+  if (dry) {
+    if (chosen) say("  would: keep the token in " + tokFile(ad.key) + (chosen.verified ? " (verified)" : " (unverified: see above)"));
+    const m = ad.mcpWire({ url: BASE, token: "<the token in " + tokFile(ad.key) + ">" });
+    const hw = ad.hooksWire({ repo: REPO });
     say("  would: " + m.command.split(String.fromCharCode(10))[0]);
-    if (ad.hooksFile) say("  would: merge hooks into " + ad.hooksFile + " (" + Object.keys(hw.hooks || {}).join(", ") + ")"); else say("  note: " + (hw.note || "no hooks for this runtime"));
+    if (ad.hooksFile) say("  would: " + (ad.hooksApply ? "write" : "merge") + " hooks into " + ad.hooksFile + " (" + Object.keys(hw.hooks || {}).join(", ") + ")"); else say("  note: " + (hw.note || "no hooks for this runtime"));
+    if (ad.hooksFile && hw.note) say("  note: " + hw.note);
     if (ad.commandsWire) { const cw = ad.commandsWire({ repo: REPO }); say("  would: install slash commands to " + cw.dir + " (" + cw.files.map((f) => cw.invokeAs(f)).join(", ") + ")"); }
-    if (ad.key !== "claude-desktop") say("  would: install the listener to start at login (" + (WIN ? "Startup folder + run_listen_" + ad.key + ".cmd" : platform() === "darwin" ? "LaunchAgent com.agentchannel.listen." + ad.key : "systemd --user unit") + ") and start it now");
+    if (ad.listener) say("  would: install the listener to start at login (" + (WIN ? "Startup folder + run_listen_" + ad.key + ".cmd" : platform() === "darwin" ? "LaunchAgent com.agentchannel.listen." + ad.key : "systemd --user unit") + ") and start it now");
     return;
   }
-  // 1. token where the hooks and listener can find it
-  if (!readTok(ad.key)) saveTok(ad.key, { token, runtime: ad.runtime, base: BASE });
-  if (WIN && ["claude", "codex"].includes(ad.key)) { try { execFileSync("setx", [ad.tokenEnv, token], { stdio: "ignore" }); ok("user env var " + ad.tokenEnv + " set (new terminals)"); } catch { warn("could not setx " + ad.tokenEnv + "; the .tok file is enough for the hooks and listener"); } }
-  else warn("export " + ad.tokenEnv + "=" + token.slice(0, 8) + "... in your shell profile (the .tok file covers hooks/listener)");
-  // 2. MCP server in the client
-  const m = ad.mcpWire({ url: BASE, token, oauth: args.includes("--oauth") });
-  const r = m.apply();
-  if (r.ok) ok("MCP server registered in " + ad.label + (r.note ? " (" + r.note + ")" : "")); else { warn("MCP not auto-registered (" + r.why + "). Run:\n      " + m.command); }
-  // 3. hooks
+
+  // --- 3. token where the hooks and listener can find it
+  if (chosen) {
+    const rec = readTok(ad.key);
+    if (!rec || rec.token !== chosen.token || (chosen.handle && rec.handle !== chosen.handle) || rec.runtime !== ad.runtime) {
+      saveTok(ad.key, { handle: chosen.handle ?? rec?.handle ?? null, agent_id: chosen.agent_id ?? rec?.agent_id ?? null, runtime: ad.runtime, token: chosen.token, base: BASE });
+    }
+    // Pinning writes the machine's real user environment. A relocated store (AGENTCHAN_HOME) is by definition not
+    // this machine's primary identity, so it must never be pinned there. refreshTokenEnv passes the token in the
+    // child process environment, never argv -- setx put it on a command line, which is visible to other processes
+    // and to agent tool output.
+    if (WIN && !!ad.hooksFile && !RELOCATED) {
+      const r = refreshTokenEnv(ad.key, chosen.token, { force: true });
+      if (r.ok && r.state !== "absent") ok("user env var " + ad.tokenEnv + " " + (r.state === "current" ? "already current" : "set (new terminals; running ones keep the old value until restarted)"));
+      else warn("could not set " + ad.tokenEnv + (r.why ? " (" + r.why + ")" : "") + "; the .tok file is enough for the hooks and listener");
+    }
+    else if (RELOCATED) warn("AGENTCHAN_HOME is set, so the token stays in " + tokFile(ad.key) + " and is not pinned into the user environment.");
+    // No slice of the token, not even a prefix: this runs inside agents whose tool output leaves the machine.
+    // The line below reads the value out of the file at paste time, in the shell that will actually run it.
+    else warn("optional, to put it in your shell environment (the .tok file already covers the hooks and the listener):\n      " + tokenEnvHint(ad.key, { file: tokFile(ad.key), env: ad.tokenEnv }).command);
+    const stale = process.env[ad.tokenEnv];
+    if (stale && stale !== chosen.token) warn(ad.tokenEnv + " in this environment holds a DIFFERENT token from the one now saved. Until it is replaced, anything that reads the environment first keeps using the old one:\n      " + tokenEnvHint(ad.key, { file: tokFile(ad.key), env: ad.tokenEnv }).command);
+  } else {
+    warn("wiring the parts that need no token; the MCP server cannot be registered without one.");
+  }
+  // --- 4. MCP server in the client
+  if (chosen) {
+    const m = ad.mcpWire({ url: BASE, token: chosen.token, oauth: args.includes("--oauth") });
+    const r = m.apply();
+    // The printed fallback carries a placeholder, not the credential: apply() above used the real token, but
+    // this line lands in agent-visible output.
+    if (r.ok) ok("MCP server registered in " + ad.label + (r.note ? " (" + r.note + ")" : "")); else { warn("MCP not auto-registered (" + r.why + "). Run:\n      " + ad.mcpWire({ url: BASE, token: "<the token in " + tokFile(ad.key) + ">", oauth: args.includes("--oauth") }).command); }
+  }
+  // --- 5. hooks: these need no token, so a missing or unmintable identity must not skip them
   const hw = ad.hooksWire({ repo: REPO });
-  if (ad.hooksFile && hw.hooks) {
+  // A runtime whose hook file is not JSON owns its own writer (grok's hooks live in ~/.grok/config.toml, and
+  // JSON.stringify over that would replace the human's whole config with our object). Ask the adapter first.
+  if (ad.hooksApply) {
+    const r = ad.hooksApply({ repo: REPO });
+    if (r.ok) ok("hooks written to " + ad.hooksFile + " (" + (r.wrote || []).join(", ") + ")");
+    else bad("could not write hooks to " + ad.hooksFile + ": " + r.why);
+    if (hw.note) warn(hw.note);
+  } else if (ad.hooksFile && hw.hooks) {
     let cur = {}; try { cur = JSON.parse(readFileSync(ad.hooksFile, "utf8")); } catch {}
     const merged = mergeHooks(cur, hw);
     mkdirSync(dirname(ad.hooksFile), { recursive: true });
@@ -194,15 +423,24 @@ async function wire(ad, token) {
     ok("hooks merged into " + ad.hooksFile + " (" + Object.keys(hw.hooks).join(", ") + (hw.statusLine ? ", statusLine" : "") + ")");
     if (hw.note) warn(hw.note);
   } else if (hw.note) warn(hw.note);
-  // 3.5 slash commands (source files in repo/commands/, copied as-is; dir/prefix/invokeAs are per-adapter in lib/adapters.mjs)
+  // --- 6. slash commands (source files in repo/commands/, copied as-is; dir/prefix/invokeAs are per-adapter in lib/adapters.mjs)
+  // Guarded per file: a package missing its commands/ (the 0.8.1 break) must cost one warn line, never the listener step below.
   if (ad.commandsWire) {
-    const cw = ad.commandsWire({ repo: REPO });
-    mkdirSync(cw.dir, { recursive: true });
-    for (const f of cw.files) writeFileSync(join(cw.dir, (cw.prefix || "") + f), readFileSync(join(cw.source, f), "utf8"));
-    ok("slash commands installed to " + cw.dir + " (" + cw.files.map((f) => cw.invokeAs(f)).join(", ") + ")");
+    try {
+      const cw = ad.commandsWire({ repo: REPO });
+      mkdirSync(cw.dir, { recursive: true });
+      const installed = [];
+      for (const f of cw.files) {
+        if (!existsSync(join(cw.source, f))) { warn("slash command source missing: " + f + " — " + cw.invokeAs(f) + " won't be available; re-run join/wire from a fresh npx"); continue; }
+        writeFileSync(join(cw.dir, (cw.prefix || "") + f), readFileSync(join(cw.source, f), "utf8"));
+        installed.push(f);
+      }
+      if (installed.length) ok("slash commands installed to " + cw.dir + " (" + installed.map((f) => cw.invokeAs(f)).join(", ") + ")");
+    } catch (e) { warn("could not install slash commands: " + e.message); }
   }
-  // 4. listener launcher + startup (Claude Desktop shares the Claude Code listener/token; nothing of its own)
-  if (["claude-desktop", "cursor", "gemini", "windsurf"].includes(ad.key)) { warn("no listener of its own; if Claude Code or Codex is wired on this machine its listener already covers toasts and files"); return; }
+  // --- 7. listener launcher + startup (Claude Desktop shares the Claude Code listener/token; nothing of its own)
+  if (!ad.listener) { warn("no listener of its own; if Claude Code or Codex is wired on this machine its listener already covers toasts and files"); return; }
+  if (DEPS_MISSING) { warn("listener not installed: its dependencies are missing. Fix:  cd " + REPO + " && npm install --omit=dev --ignore-scripts   then re-run: npx @amkentech/agent-channel wire"); return; }
   const cmdFile = join(REPO, "run_listen_" + ad.key + ".cmd");
   if (WIN) {
     if (!existsSync(cmdFile)) writeFileSync(cmdFile, "@echo off\r\ncd /d " + REPO + "\r\nnode scripts\\listen.mjs --runtime " + ad.key + " >> \"%USERPROFILE%\\.agentchan\\listen-" + ad.key + ".log\" 2>&1\r\n");
@@ -211,7 +449,8 @@ async function wire(ad, token) {
     try { mkdirSync(startup, { recursive: true }); writeFileSync(vbs, 'Set sh = CreateObject("WScript.Shell")\r\nsh.Run """' + cmdFile + '""", 0, False\r\n'); ok("listener starts at logon (" + vbs + ")"); }
     catch (e) { warn("could not write startup entry: " + e.message); }
     // start now if not running
-    if (!listenerFresh(ad)) { try { spawn("wscript", [vbs], { detached: true, stdio: "ignore", windowsHide: true }).unref(); ok("listener started now"); } catch { warn("start the listener: " + cmdFile); } }
+    if (!chosen) warn("not starting the listener: it has no token to connect with");
+    else if (!listenerFresh(ad)) { try { spawn("wscript", [vbs], { detached: true, stdio: "ignore", windowsHide: true }).unref(); ok("listener started now"); } catch { warn("start the listener: " + cmdFile); } }
     else ok("listener already running");
   } else if (platform() === "darwin") {
     // macOS: a per-user LaunchAgent keeps the listener alive across logins (KeepAlive) and starts it now
@@ -271,26 +510,92 @@ async function doctor() {
   say("Agent Channel doctor  (server " + BASE + ")");
   try { const h = await api("/health"); ok("server reachable, listeners connected: " + h.listeners); } catch (e) { bad("server unreachable: " + e.message); }
   const ads = Object.values(ADAPTERS).filter((a) => a.key !== "generic" && a.detect());
-  if (!ads.length) warn("no agent CLI detected (Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf)");
+  if (!ads.length) warn("no agent CLI detected (Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf, Grok CLI)");
   for (const ad of ads) {
     say("");
     say(ad.label + ":");
     const token = tokenFor(ad);
-    if (!token) { bad("no token (" + ad.tokenEnv + " or " + tokFile(ad.key) + "). Already have a handle: setup.mjs signin <handle> --runtime " + ad.key + ". New: setup.mjs join <code> <handle> \"<Name>\" --runtime " + ad.key); continue; }
+    if (!token) { bad("no token (" + ad.tokenEnv + " or " + tokFile(ad.key) + "). Already have a handle: npx @amkentech/agent-channel signin <handle> --runtime " + ad.key + ". New: npx @amkentech/agent-channel join <code> <handle> \"<Name>\" --runtime " + ad.key); continue; }
     let me = null;
     try { me = await api("/peek", null, token); ok("token valid, you are @" + me.handle + " (" + (me.unread_messages + me.proposals_awaiting_you + me.artifacts_waiting) + " waiting)"); }
     catch (e) { bad("token rejected: " + e.message + (e.cause ? " (" + (e.cause.code || e.cause.message) + ")" : "")); }
-    const m = ad.mcpWire({ url: BASE, token }); const c = m.check();
-    if (c === true) ok("MCP server registered"); else if (c === false) bad("MCP server not registered. " + (ad.key === "claude-desktop" ? "Run: node scripts/setup.mjs wire --runtime desktop   (or Desktop > Settings > Connectors > Add custom connector > " + BASE + "/mcp)" : m.command.split(String.fromCharCode(10))[0])); else warn("could not check MCP registration (client CLI not on PATH)");
+    // The environment and the tok file are two stores of the same credential, and they DRIFT: wire pinned the
+    // env var, a later remint rewrote only the file, and everything env-first (the hooks, the listener) kept
+    // authenticating with the dead token for nine hours while doctor's line above -- which reads env-first
+    // too -- was the only symptom. Name the split explicitly: which store is current, which is stale, and
+    // that a stale ENVIRONMENT wins over a good file until it is refreshed. Distinct from "token rejected"
+    // (no working credential anywhere) and from the baked-MCP-header line (a different identity entirely).
+    {
+      const envTok = process.env[ad.tokenEnv];
+      const fileTok = readTok(ad.key)?.token || null;
+      if (envTok && fileTok && envTok !== fileTok) {
+        const probe = async (t) => { try { await api("/peek", null, t); return true; } catch { return false; } };
+        const envOk = await probe(envTok), fileOk = await probe(fileTok);
+        if (!envOk && fileOk) bad("env var " + ad.tokenEnv + " holds a stale token; " + tokFile(ad.key) + " is current. Anything env-first is deaf until it is refreshed. Fix: npx @amkentech/agent-channel wire --runtime " + ad.key + ", then restart open terminals.");
+        else if (envOk && !fileOk) warn(tokFile(ad.key) + " holds a stale token; the environment (" + ad.tokenEnv + ") is current. Re-run wire to rewrite the file.");
+        else warn(ad.tokenEnv + " and " + tokFile(ad.key) + " hold DIFFERENT tokens (both " + (envOk ? "accepted" : "rejected") + " by the server). Anything env-first uses the environment one; re-run wire to converge them.");
+      }
+    }
+    // "valid" is not the same as "this runtime's". A token can authenticate perfectly and still be another
+    // runtime's agent -- which is the whole failure this file's wire path exists to fix, and which doctor
+    // could not see: it asked /peek, which answers for the person, and never asked which AGENT the token is.
+    // The same three states as wire: could-not-verify says so rather than passing silently.
+    const id = await identify(token);
+    if (id.state === "ok" && id.runtime !== ad.runtime) bad("this token is a '" + id.runtime + "' agent, not '" + ad.runtime + "'. It reads and can ACK that runtime's mail. Fix: npx @amkentech/agent-channel wire --runtime " + ad.key);
+    else if (id.state === "ok") ok("token is this runtime's own agent (" + id.runtime + ")");
+    else if (id.state === "unknown") warn("could not verify which agent this token is (" + id.why + ")");
+    // Display placeholder, never the credential: this command is PRINTED (into a terminal that is often an
+    // agent's tool output), and check()/auth() read the client's config, not the token argument. The dry-run
+    // path made the same substitution for the same reason.
+    const m = ad.mcpWire({ url: BASE, token: "<the token in " + tokFile(ad.key) + ">" }); const c = m.check();
+    if (c === true) ok("MCP server registered"); else if (c === false) bad("MCP server not registered. " + (ad.key === "claude-desktop" ? "Run: npx @amkentech/agent-channel wire --runtime desktop   (or Desktop > Settings > Connectors > Add custom connector > " + BASE + "/mcp)" : m.command.split(String.fromCharCode(10))[0])); else warn("could not check MCP registration (client CLI not on PATH)");
+    if (typeof m.auth === "function") {
+      const a = m.auth();
+      if (a?.mode === "baked") bad("MCP Authorization is a baked token, not ${" + ad.tokenEnv + "}. This runtime can silently borrow another identity. Fix: npx @amkentech/agent-channel wire --runtime " + ad.key);
+      else if (a?.mode === "env") ok("MCP Authorization reads " + ad.tokenEnv);
+      else if (a?.mode === "missing" && c === true) bad("MCP Authorization is missing. " + ad.label + " would connect with no token. Fix: npx @amkentech/agent-channel wire --runtime " + ad.key);
+    }
     if (ad.hooksFile) {
       let txt = ""; try { txt = readFileSync(ad.hooksFile, "utf8"); } catch {}
       const has = (name) => txt.includes("hooks/" + name) || txt.includes("hooks\\\\" + name) || txt.includes("hooks\\" + name);
-      has("inbox.mjs") ? ok("inbox hook (type-to-send + waiting banner) wired") : bad("inbox hook missing in " + ad.hooksFile + "  (setup.mjs wire --runtime " + ad.key + ")");
+      // Ask the adapter whether it wires this at all before calling its absence a fault. grok deliberately does
+      // not: its UserPromptSubmit ignores hook stdout and exit codes, so type-to-send cannot block the prompt
+      // and would double-send every message through the model. Reporting that as a missing hook would send a
+      // human to re-run wire forever; reporting nothing would read as full coverage. So it says which it is.
+      if (wiresHook(ad, "inbox.mjs")) has("inbox.mjs") ? ok("inbox hook (type-to-send + waiting banner) wired") : bad("inbox hook missing in " + ad.hooksFile + "  (npx @amkentech/agent-channel wire --runtime " + ad.key + ")");
+      else warn("no inbox hook on this runtime by design: typing @handle does NOT send here, and no waiting banner is shown. Mail arrives when the model reads my_inbox (the server attaches new mail to tool results).");
       if (ad.supportsFileChanged) has("notify.mjs") ? ok("idle notifications (FileChanged) wired") : warn("FileChanged notify hook missing");
-      if (ad.key === "claude") has("btw.mjs") ? ok("mid-turn arrivals (PostToolUse) wired") : warn("mid-turn arrival hook missing (messages wait for your next prompt): setup.mjs wire --runtime claude");
-      if (ad.supportsPreExec) has("secret-guard.mjs") ? ok("credential guard (PreToolUse) wired") : warn("credential guard missing (an agent could put a secret on a command line): setup.mjs wire --runtime " + ad.key);
-      if (ad.key === "claude") has("claude-status.mjs") ? ok("status hooks wired") : warn("status hooks missing");
+      if (wiresHook(ad, "btw.mjs")) has("btw.mjs") ? ok("mid-turn arrivals wired") : warn("mid-turn arrival hook missing (messages wait for your next prompt): npx @amkentech/agent-channel wire --runtime " + ad.key);
+      if (ad.supportsPreExec) has("secret-guard.mjs") ? ok("credential guard (PreToolUse) wired") : warn("credential guard missing (an agent could put a secret on a command line): npx @amkentech/agent-channel wire --runtime " + ad.key);
+      if (wiresHook(ad, "claude-status.mjs")) has("claude-status.mjs") ? ok("status hooks wired") : warn("status hooks missing");
     }
+    // Codex has no post-tool hook, so mid-turn delivery runs the other way round: the resident listener pushes
+    // into a live Codex thread over the app-server WebSocket. Three links, and the last is a human habit - the
+    // TUI must be started with codex-remote.cmd. Miss it and the first two still look perfect while every push
+    // is dropped. Report the OUTCOME, not the wiring: on 2026-08-27 this path had delivered 0 of 16 attempts
+    // here and doctor called Codex fully wired throughout, because the only evidence was a line in a log file.
+    if (ad.key === "codex") {
+      let launcher = ""; try { launcher = readFileSync(join(REPO, "run_listen_codex.cmd"), "utf8"); } catch {}
+      const ws = configuredWs(launcher, process.env);
+      const { host, port } = wsHostPort(ws.url);
+      const reach = await probe(host, port);
+      const attached = reach.reachable ? await probeLoadedThread(ws.url) : { loaded: false, reason: reach.reason };
+      let logTxt = ""; try { logTxt = readFileSync(join(HOME_STORE, "listen-codex.log"), "utf8"); } catch {}
+      const summary = summarizePushLog(logTxt);
+      const v = pushVerdict({ summary, reachable: reach.reachable, loaded: attached.loaded });
+      (reach.reachable ? ok : warn)("app-server " + (reach.reachable ? "reachable" : "not reachable (" + (reach.reason || "?") + ")") + " at " + ws.url + " (from " + ws.source + ")");
+      (attached.loaded ? ok : warn)(attached.loaded ? "loaded Codex thread available (" + attached.threadId.slice(0, 8) + ")" : "no loaded Codex thread available (" + (attached.reason || "unknown") + ")");
+      (v.level === "ok" ? ok : v.level === "warn" ? warn : bad)("mid-turn delivery: " + v.text);
+    }
+    // What the hook SWALLOWED. The hook is silent on failure on purpose - it must never break a prompt - so
+    // before 2026-08-27 a rejected token, an unreachable server or an unwritable state file left no trace at
+    // all, and the banner just quietly stopped working. It now records each one; this is where a human finally
+    // sees them. Silence about the silence was the actual defect.
+    const swallowed = summarizeDiag(readDiag(HOME_STORE, ad.key, 200));
+    if (swallowed.length) {
+      warn("this hook swallowed " + swallowed.reduce((n, x) => n + x.count, 0) + " failure(s) recently (diag-" + ad.key + ".jsonl):");
+      for (const x of swallowed.slice(0, 5)) say("     " + x.step + " x" + x.count + "  last: " + (x.last_err || "?") + "  at " + (x.last_at || "?"));
+    } else ok("no swallowed failures recorded");
     // Say what this runtime CANNOT do, out loud. The 2026-08-22 credential leak happened in a runtime with no
     // pre-execution hook; nothing installable here could have blocked it, and pretending otherwise is worse
     // than the gap. A pass with no stated scope reads as full coverage.
@@ -298,9 +603,9 @@ async function doctor() {
     if (ad.commandsWire) {
       const cw = ad.commandsWire({ repo: REPO });
       const have = cw.files.every((f) => existsSync(join(cw.dir, (cw.prefix || "") + f)));
-      have ? ok("slash commands wired (" + cw.files.map((f) => cw.invokeAs(f)).join(", ") + ")") : bad("slash commands missing in " + cw.dir + "  (setup.mjs wire --runtime " + ad.key + ")");
+      have ? ok("slash commands wired (" + cw.files.map((f) => cw.invokeAs(f)).join(", ") + ")") : bad("slash commands missing in " + cw.dir + "  (npx @amkentech/agent-channel wire --runtime " + ad.key + ")");
     }
-    if (["claude-desktop", "cursor", "gemini", "windsurf"].includes(ad.key)) continue;
+    if (!ad.listener) continue;
     const h = ownerHandle(ad);
     if (!h) bad("listener has never connected for this runtime (no owner marker). Start it: " + startHint(ad));
     else if (listenerFresh(ad)) ok("listener running as @" + h);
@@ -339,6 +644,10 @@ async function doctor() {
 if (cmd === "join") await join_();
 else if (cmd === "signin") await signin_();
 else if (cmd === "init") await init_();
-else if (cmd === "wire") { const ads = runtimesWanted(); for (const ad of ads) await wire(ad, opt("--token") || tokenFor(ad)); }
+else if (cmd === "wire") { const ads = runtimesWanted(); for (const ad of ads) await wire(ad, opt("--token")); }
 else if (cmd === "doctor" || cmd === "status") await doctor();
-else { say("usage: setup.mjs join <inv_code> <handle> \"<Display Name>\" [--runtime claude|codex|all] [--email x]\n       setup.mjs signin <handle> [--runtime ...]        existing identity, new machine or runtime\n       setup.mjs init                                     detect every agent CLI, register into each, verify\n       setup.mjs wire [--runtime claude|codex|desktop|all] [--token ac_...] [--oauth] [--dry-run]\n       setup.mjs doctor"); process.exit(1); }
+else { say("usage: npx @amkentech/agent-channel join <inv_code> <handle> \"<Display Name>\" [--runtime claude|codex|grok|all] [--email x]\n       npx @amkentech/agent-channel signin <handle> [--runtime ...]        existing identity, new machine or runtime\n       npx @amkentech/agent-channel init                                     detect every agent CLI, register into each, verify\n       npx @amkentech/agent-channel wire [--runtime claude|codex|desktop|grok|all] [--token ac_...] [--oauth] [--dry-run]\n       npx @amkentech/agent-channel doctor"); process.exit(1); }
+
+// A run that could not give a runtime its own identity has not done the job it was asked to do. It used to
+// say one line and exit 0, which is indistinguishable from success to anything scripting this.
+if (wiringIncomplete) process.exitCode = 1;

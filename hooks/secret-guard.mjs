@@ -120,15 +120,40 @@ function secrets() {
   return out;
 }
 
+// Two runtimes, two blocking contracts, and getting this wrong is silent.
+//
+// Claude Code reads hookSpecificOutput.permissionDecision. Gemini CLI reads a TOP-LEVEL `decision`:
+// isBlockingDecision() { return this.decision === "block" || this.decision === "deny" }. The string
+// "permissionDecision" does not appear anywhere in the gemini 0.56.0 bundle, so a Claude-shaped refusal is
+// parsed, found non-blocking, and the command runs -- while doctor reports the guard as wired and
+// supportsPreExec suppresses the warning that would have disclosed it. A guard that reports success and lets
+// the secret through is worse than no guard, which is the whole reason this file exists.
+//
+// Both keys are emitted together: they occupy different levels of the same object, each runtime reads its own,
+// and neither sees a field it does not understand. Verified against both bundles rather than assumed.
+// Two runtimes, two incompatible refusal shapes, and picking wrong fails SILENTLY in both directions.
+//
+// Claude Code reads hookSpecificOutput.permissionDecision. Gemini CLI reads a TOP-LEVEL `decision`:
+// isBlockingDecision() { return this.decision === "block" || this.decision === "deny" }, and the string
+// "permissionDecision" appears nowhere in the gemini 0.56.0 bundle -- so a Claude-shaped refusal is parsed,
+// found non-blocking, and the command runs.
+//
+// The obvious fix, emitting both keys at once, was tested live on 2026-08-27 and is WRONG: with a top-level
+// `decision: "deny"` present, Claude Code discarded the entire hook output and ran the command. ("deny" is not
+// one of its accepted top-level values.) Same command, field removed, blocked. So the shape is exclusive, and
+// the wrong guess disables the guard on whichever runtime you were not testing.
+//
+// The shape therefore travels on argv from lib/adapters.mjs (--deny-shape=decision), because the adapter is
+// where a runtime's contract belongs. No runtime name appears in this file: a new runtime is an adapter entry.
+const DENY_SHAPE = (process.argv.find((a) => a.startsWith("--deny-shape=")) || "").split("=")[1] || "permission";
+
 function deny(reason) {
   process.stdout.write(
-    JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: reason,
-      },
-    })
+    JSON.stringify(
+      DENY_SHAPE === "decision"
+        ? { decision: "deny", reason }
+        : { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } }
+    )
   );
   process.exit(0);
 }
@@ -141,7 +166,14 @@ try {
   process.exit(0);
 }
 
-const command = input?.tool_input?.command;
+// Claude Code, Codex and Gemini send the stdin envelope in snake_case; grok 1.0.5 sends the SAME fields in
+// camelCase throughout (`toolInput`, `hookEventName`, `stopHookActive`, and `toolResult` where Claude has
+// `tool_response`) -- read out of the shipped hook reference in grok.exe, which lists it as the first porting
+// difference. Reading only `tool_input` there yields undefined, this file exits 0, and every command runs
+// while doctor reports the guard as wired and supportsPreExec suppresses the warning: the silent-success
+// failure the comment above exists to prevent, arriving through the payload instead of the refusal shape.
+// Accept both spellings rather than branch on a runtime name; a runtime is an adapter entry, not an if.
+const command = (input?.tool_input ?? input?.toolInput)?.command;
 if (typeof command !== "string" || !command) process.exit(0);
 
 for (const s of secrets()) {

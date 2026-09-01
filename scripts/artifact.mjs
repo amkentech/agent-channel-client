@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 // End-to-end encrypted artifact exchange. The server only ever sees ciphertext + an envelope.
 //
-//   node scripts/artifact.mjs send @handle <path> [--note "why"]     encrypt to every key @handle has registered, upload
+//   node scripts/artifact.mjs send @handle <path> [--note "why"] [--contract <id>]
+//        encrypt to every key @handle has registered, upload; --contract binds the file to an open contract so it lasts
 //   node scripts/artifact.mjs fetch <artifact_id>                    download, decrypt with a local key, inspect, save to ~/.agentchan/<me>/inbox/
 //   node scripts/artifact.mjs fetch --all                            fetch everything waiting for me
 //   node scripts/artifact.mjs keygen [--label name]                  create + register a key for this token (listener does this automatically)
@@ -9,7 +10,9 @@
 //   node scripts/artifact.mjs revoke-key <key_id> | --all            revoke a key (lost device: run from any OTHER machine of yours)
 //   node scripts/artifact.mjs keys [@handle]                         list registered public keys
 //
-// Token: AGENTCHAN_TOKEN (or --runtime codex -> AGENTCHAN_CODEX_TOKEN). URL: AGENTCHAN_URL.
+// Token: this runtime's own variable, per lib/adapters.mjs (--runtime claude -> AGENTCHAN_TOKEN, codex ->
+// AGENTCHAN_CODEX_TOKEN, windsurf -> AGENTCHAN_WINDSURF_TOKEN, ...), else ~/.agentchan/tok.<runtime>.json.
+// URL: AGENTCHAN_URL.
 
 import { readFileSync, statSync, writeFileSync, mkdirSync, existsSync, readdirSync } from "node:fs";
 import { basename, join, resolve, dirname } from "node:path";
@@ -23,10 +26,12 @@ const flag = (name) => { const i = args.indexOf(name); return i >= 0 ? args[i + 
 const has = (name) => args.includes(name);
 const runtime = (flag("--runtime") || process.env.AGENTCHAN_RUNTIME || "claude").toLowerCase();
 const BASE = (process.env.AGENTCHAN_URL || "https://channel.amkentech.com").replace(/\/mcp$/, "");
-let token = process.env.AGENTCHAN_TOKEN;
-if (runtime === "codex" && process.env.AGENTCHAN_CODEX_TOKEN) token = process.env.AGENTCHAN_CODEX_TOKEN;
-if (!token) { const { tokenFor } = await import("../lib/paths.mjs"); token = tokenFor(runtime); }
-if (!token) { console.error("AGENTCHAN_TOKEN required"); process.exit(1); }
+// One resolver for every runtime (lib/paths.mjs). The old order put the bare AGENTCHAN_TOKEN first, so this
+// script ignored the runtime's OWN variable even when it was correctly set, and every non-codex runtime
+// encrypted, fetched and registered keys as claude-code.
+const { tokenFor, tokenEnvFor } = await import("../lib/paths.mjs");
+const token = tokenFor(runtime);
+if (!token) { console.error("no token for '" + runtime + "': set " + tokenEnvFor(runtime) + ", or run  node scripts/setup.mjs wire --runtime " + runtime); process.exit(1); }
 const H = { authorization: "Bearer " + token, "content-type": "application/json" };
 
 const api = async (path, init = {}) => {
@@ -69,7 +74,7 @@ function savePins(to, keys) {
 try {
   if (cmd === "send") {
     const to = args[1], path = args[2];
-    if (!to || !path) throw new Error("usage: artifact.mjs send @handle <path> [--note text]");
+    if (!to || !path) throw new Error("usage: artifact.mjs send @handle <path> [--note text] [--contract id]");
     const abs = resolve(path);
     const st = statSync(abs);
     if (st.size > 8 * 1024 * 1024) throw new Error("file is " + st.size + " bytes; 8 MB max");
@@ -98,8 +103,9 @@ try {
     else if (fresh.length) console.error("trusting " + fresh.length + " new key(s) for " + to + " as instructed: " + fresh.map((k) => fp(k.public_key)).join(", "));
     savePins(to, useKeys);
     const { envelope, ciphertext } = encryptFor(useKeys, bytes);
-    const r = await api("/artifacts", { method: "POST", body: JSON.stringify({ to, filename: basename(abs), size_bytes: st.size, sha256: sha256hex(bytes), note: flag("--note"), envelope, ciphertext }) });
-    console.log("sent " + basename(abs) + " (" + st.size + " bytes) to " + r.to + ", encrypted to " + keys.length + " key(s), artifact " + r.artifact_id + ", expires " + r.expires_at);
+    const contractId = flag("--contract");
+    const r = await api("/artifacts", { method: "POST", body: JSON.stringify({ to, filename: basename(abs), size_bytes: st.size, sha256: sha256hex(bytes), note: flag("--note"), envelope, ciphertext, proposal_id: contractId || undefined }) });
+    console.log("sent " + basename(abs) + " (" + st.size + " bytes) to " + r.to + ", encrypted to " + keys.length + " key(s), artifact " + r.artifact_id + (r.proposal_id ? ", bound to contract " + r.proposal_id : ", expires " + r.expires_at));
   } else if (cmd === "fetch") {
     const me = await myHandle();
     if (has("--all") || !args[1]) {

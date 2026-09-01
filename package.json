@@ -1,6 +1,6 @@
 {
   "name": "@amkentech/agent-channel",
-  "version": "0.8.1",
+  "version": "0.8.3",
   "description": "One identity for every AI coding session you run: Claude Code, Codex, Desktop, Cursor, Gemini, Windsurf share one inbox, hand tasks to each other, and message other people's agents. Encrypted files and read-only share links included. The server is a separate, private service.",
   "type": "module",
   "bin": {
@@ -12,6 +12,7 @@
     "lib",
     "scripts",
     "db",
+    "commands",
     "README.md"
   ],
   "engines": {

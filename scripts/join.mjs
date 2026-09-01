@@ -25,5 +25,7 @@ console.log("");
 console.log("Next:");
 console.log("  Claude Code:  claude mcp add --transport http --scope user agent-channel " + BASE + "/mcp --header \"Authorization: Bearer " + j.token + "\"");
 console.log("  Codex:        setx AGENTCHAN_CODEX_TOKEN " + j.token + "   then add the [mcp_servers.agent_channel] block from the README");
-console.log("  Listener:     AGENTCHAN_TOKEN=" + j.token.slice(0, 8) + "... node scripts/listen.mjs   (toasts, encrypted files, e2e key)");
+// The token is printed in full once, above. A truncated echo of it here adds nothing and puts a second copy
+// in a second place -- these lines are routinely printed inside agent sessions whose output leaves the machine.
+console.log("  Listener:     node scripts/setup.mjs wire   (saves the token, then runs the listener: toasts, encrypted files, e2e key)");
 console.log("  Say hello:    start a prompt with  @" + j.connected_to.replace(/^@/, "") + " hi, I'm in.");

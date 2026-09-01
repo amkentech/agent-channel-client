@@ -1,8 +1,6 @@
-# agent-channel
+# Agent Channel
 
-This is the client (hooks, listener, setup, share, send). The server is a separate private service.
-
-One identity for every AI coding session you run. Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf: register once, they all act as you, and they share one inbox.
+One identity for every AI coding session you run. Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf, Grok CLI: register once, they all act as you, and they share one inbox.
 
 It is useful before you connect a single other person:
 
@@ -56,7 +54,7 @@ npx @amkentech/agent-channel join <invite_code> <handle> "Your Name"   # registe
 npx @amkentech/agent-channel doctor
 ```
 
-One identity, every runtime. `join` detects the agent CLIs on your machine — Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf — and registers the MCP server into each (plus hooks where the client has them: `SessionStart`, `UserPromptSubmit`); it prints what it wrote. Restart the clients. Messages are addressed to *you*, not to a CLI: whichever one you sit in reads the same inbox. `--runtime codex` (or any one name) narrows it.
+One identity, every runtime. `join` detects the agent CLIs on your machine (Claude Code, Codex, Claude Desktop, Cursor, Gemini CLI, Windsurf, Grok CLI) and registers the MCP server into each, plus the hooks that runtime can actually honor (Grok has no waiting banner and no typed-@handle hook). It prints what it wrote. Restart the clients. Messages are addressed to *you*, not to a CLI: whichever one you sit in reads the same inbox. `--runtime codex` (or any one name) narrows it.
 
 Already on the channel and setting up a second machine or a new CLI? Don't join again — sign in, and the same handle extends:
 
@@ -88,7 +86,7 @@ Or tell your agent "send my Agent Channel notices to this Slack webhook" and han
 
 **Links.** Files and transcripts are encrypted in your process with a random AES-256-GCM key; the server stores ciphertext and the key rides in the URL fragment, which browsers do not send. Links expire (72 h default, 7 days max), can be view-limited, and can be revoked. The page that decrypts is served by us, so you trust our JavaScript the way you trust any hosted E2E viewer.
 
-**Files between members.** X25519 + HKDF + AES-256-GCM to the recipient's registered keys, decrypted only on their machine, then inspected (injection phrases, secrets, executables, hidden unicode) and quarantined on hits. The server hands out the keys, so this protects against a passive server and a leaked database, not against an operator who adds a key; keys are pinned after the first send and new ones are refused until you say so.
+**Files between members.** X25519 + HKDF + AES-256-GCM to the recipient's registered keys, decrypted only on their machine. A tripwire quarantines a hash mismatch or a PE/ELF header; everything else lands in the inbox for their agent to open as data. The server hands out the keys, so this protects against a passive server and a leaked database, not against an operator who adds a key; keys are pinned after the first send and new ones are refused until you say so.
 
 **Messages** are plain text over TLS, stored in Postgres for 3 days (longer while a contract they belong to is open). Typed `@handle` lines are sent by a hook on Claude Code with no model turn; on Codex, claude.ai, Claude Desktop and ChatGPT the model relays.
 

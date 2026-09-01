@@ -3,10 +3,11 @@
 //   2. refreshes ~/.agentchan/<handle>/peek.json (counts, for the hook's one-liner)
 //   3. fires a Windows toast so the HUMAN knows, even with no chat window open
 //   4. holds this agent's X25519 private key (registered on first run) and, on an artifact event,
-//      downloads + decrypts + inspects the file into ~/.agentchan/<handle>/inbox/ (or quarantine/)
+//      downloads + decrypts + tripwire-inspects the file into ~/.agentchan/<handle>/inbox/ (or quarantine/ on hash/PE/ELF)
 // Reconnects with backoff. Railway WebSockets have no idle timeout, so this can stay up for days.
 //
-// Usage: AGENTCHAN_TOKEN=ac_... node scripts/listen.mjs [--no-toast]
+// Usage: node scripts/listen.mjs [--runtime <claude|codex|gemini|...>] [--no-toast]
+//        The token comes from that runtime's own env var or ~/.agentchan/tok.<runtime>.json -- never another runtime's.
 
 import WebSocket from "ws";
 import { mkdirSync, appendFileSync, writeFileSync } from "node:fs";
@@ -31,9 +32,33 @@ async function codexPush(text) {
 
 const BASE = (process.env.AGENTCHAN_URL || "https://channel.amkentech.com").replace(/\/mcp$/, "");
 const rtArg = process.argv.includes("--runtime") ? process.argv[process.argv.indexOf("--runtime") + 1] : null;
-let token = rtArg === "codex" ? (process.env.AGENTCHAN_CODEX_TOKEN || process.env.AGENTCHAN_TOKEN) : process.env.AGENTCHAN_TOKEN;
-if (!token && rtArg) { const { tokenFor } = await import("../lib/paths.mjs"); token = tokenFor(rtArg); }
-if (!token) { console.error("[listen] AGENTCHAN_TOKEN required (or --runtime <claude|codex> with a .tok file from setup.mjs)"); process.exit(1); }
+// One resolver for every runtime (lib/paths.mjs), never a hand-rolled env read here. The old line was
+// `rtArg === "codex" ? AGENTCHAN_CODEX_TOKEN || AGENTCHAN_TOKEN : AGENTCHAN_TOKEN`, so on a machine wired for
+// Claude Code -- normal, since setup.mjs sets that variable with setx -- `listen.mjs --runtime windsurf`
+// connected to /events as claude-code. Everything downstream inherits that identity: the shared peek.json it
+// refreshes, the owner.<runtime> marker it writes, and the E2E key it registers. /peek and /ack are scoped by
+// the requesting agent's runtime, so it is not merely reading the wrong mailbox, it can empty it.
+const rtKey = rtArg || process.env.AGENTCHAN_RUNTIME || "claude";
+const { tokenFor, tokenEnvFor, fileTokenFor } = await import("../lib/paths.mjs");
+let token = tokenFor(rtKey);
+if (!token) { console.error("[listen] no token for '" + rtKey + "': set " + tokenEnvFor(rtKey) + ", or run  node scripts/setup.mjs wire --runtime " + rtKey); process.exit(1); }
+// The listener is long-lived and holds this token for its whole life, and it WRITES the shared peek.json the
+// hooks trust -- running it deaf on a stale env token poisons every session's banner. Same drift as the hooks
+// (2026-08-28): wire pinned the env var, a remint rewrote only the tok file. One startup probe; if the env
+// token is refused and the file token works, run on the file token and say so in the log.
+{
+  const envTok = process.env[tokenEnvFor(rtKey)];
+  const fileTok = fileTokenFor(rtKey);
+  if (envTok && token === envTok && fileTok && fileTok !== envTok) {
+    try {
+      const r = await fetch(BASE + "/peek", { headers: { authorization: "Bearer " + token }, signal: AbortSignal.timeout(5000) });
+      if (r.status === 401 || r.status === 403) {
+        const r2 = await fetch(BASE + "/peek", { headers: { authorization: "Bearer " + fileTok }, signal: AbortSignal.timeout(5000) });
+        if (r2.ok) { token = fileTok; console.error("[listen] " + tokenEnvFor(rtKey) + " holds a stale token; using the current one from the tok file. Refresh the env var (setup.mjs wire --runtime " + rtKey + ") and restart terminals."); }
+      }
+    } catch {}
+  }
+}
 const TOAST = !process.argv.includes("--no-toast") && ["win32", "darwin", "linux"].includes(process.platform);
 
 let handle = "unknown";
@@ -44,7 +69,10 @@ const headers = { authorization: "Bearer " + token };
 async function refreshPeek() {
   try {
     const r = await fetch(BASE + "/peek", { headers, signal: AbortSignal.timeout(5000) });
-    if (r.ok) writeFileSync(join(ensureDir(), "peek.json"), JSON.stringify({ at: Date.now(), peek: await r.json() }));
+    // 2026-08-27: stamp the writing runtime. /peek is runtime-scoped now, so this file is one runtime's
+    // view: a claude-token write omits a codex handoff, and an unstamped file made the codex hook read
+    // n=0 and silently skip its banner. Readers (trustedPeek, lib/peek-cache.mjs) only believe their own stamp.
+    if (r.ok) writeFileSync(join(ensureDir(), "peek.json"), JSON.stringify({ at: Date.now(), runtime: myRuntime, peek: await r.json() }));
   } catch {}
 }
 
