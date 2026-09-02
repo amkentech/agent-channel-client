@@ -19,16 +19,23 @@
 // accident, not an adversary. Exit 0 always -- a crashing hook must not wedge
 // the session.
 
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { readFileSync, existsSync, statSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const CONFIG = join(homedir(), ".agentchan", "secret-guard.json");
+// Same rule as lib/paths.mjs HOME_STORE, inlined so this hook stays dependency-free: AGENTCHAN_HOME relocates
+// the store (a second identity on one machine, or a test that must not read the real credentials).
+const HOME_STORE = process.env.AGENTCHAN_HOME || join(homedir(), ".agentchan");
+const CONFIG = join(HOME_STORE, "secret-guard.json");
 
-const DEFAULT_SOURCES = [
-  join(homedir(), "agent-channel", ".dbpw"),
-  join(homedir(), "agent-channel", ".env.local"),
-];
+// Everything machine-specific lives in ~/.agentchan/secret-guard.json, never here: this file ships to strangers.
+//   {
+//     "sources": ["~/my-repo/.env.local", ...],        credential files whose values must never appear in argv
+//     "scan_token_files": true,                        also guard the Agent Channel tokens in ~/.agentchan/tok.*.json
+//     "unsafe_operations": [{ "id", "match", "unsafe", "reason" }, ...]   see below
+//   }
+// docs/secret-guard.example.json is a complete, working example.
+const DEFAULT_SOURCES = [];
 
 // Flags whose value is a credential often enough that an inline literal is
 // always the wrong call: pass these through an env var or stdin instead.
@@ -50,31 +57,16 @@ const PLACEHOLDER =
 // us: a PostToolUse hook can only append context, never replace a tool result, so by the
 // time the secret is printed it is already in the transcript. PreToolUse is the last point
 // that still runs before the process does. Each entry names its own escape hatch.
-const UNSAFE_OPERATIONS = [
-  {
-    id: "supabase-db-echo",
-    // `supabase db ...` in any mode whose whole job is to print what it would have done.
-    match: /(^|[\s;&|(])(npx\s+(--yes\s+)?)?supabase\s+db\b/i,
-    unsafe: (c) => /(^|\s)(--dry-run|--debug|--verbose|-v)(\s|=|$)/i.test(c),
-    reason:
-      "Blocked: 'supabase db' in a dry-run/debug/verbose mode. This CLI has printed the " +
-      "database password it resolved (v2.115.0 expanded PGPASSWORD into a generated script " +
-      "and echoed it), so the credential reaches tool output even when the command line is " +
-      "clean. Run it without the preview flag, redirect the output to a gitignored file " +
-      "instead of returning it, or ask Johnathan to run it himself.",
-  },
-  {
-    id: "railway-variables-read",
-    // A bare listing prints every value in the environment, ADMIN_KEY and DATABASE_URL included.
-    match: /(^|[\s;&|(])railway\s+variables\b/i,
-    unsafe: (c) => !/(^|\s)--set/i.test(c),
-    reason:
-      "Blocked: 'railway variables' without --set prints every value in the service " +
-      "environment, which here includes ADMIN_KEY and DATABASE_URL. Reading them into tool " +
-      "output discloses them. Use 'railway variables --set-from-stdin KEY' to write, or ask " +
-      "Johnathan to read them himself.",
-  },
-];
+//
+// Which operations do this is a property of the tools YOUR machine runs, so the list ships
+// empty and is read from the config file's `unsafe_operations`:
+//   { "id": "supabase-db-echo",
+//     "match":  "(^|[\\s;&|(])(npx\\s+(--yes\\s+)?)?supabase\\s+db\\b",   the command family (regex source)
+//     "unsafe": "(^|\\s)(--dry-run|--debug|--verbose|-v)(\\s|=|$)",        the mode that echoes (regex source)
+//     "reason": "Blocked: ..." }
+// A command is refused when BOTH regexes match (compiled case-insensitive). A negative lookahead
+// expresses "unless": "^(?![\\s\\S]*--set)". A malformed regex skips that entry and blocks nothing.
+const DEFAULT_UNSAFE_OPERATIONS = [];
 
 function readStdin() {
   try {
@@ -84,23 +76,85 @@ function readStdin() {
   }
 }
 
-function sources() {
-  if (existsSync(CONFIG)) {
-    try {
-      const cfg = JSON.parse(readFileSync(CONFIG, "utf8"));
-      if (Array.isArray(cfg.sources)) return cfg.sources;
-    } catch {
-      // Malformed config: fall through to defaults rather than guarding nothing.
+// Read once; a malformed file is treated as absent rather than guarding nothing at all.
+let cfgCache;
+function config() {
+  if (cfgCache !== undefined) return cfgCache;
+  cfgCache = null;
+  try {
+    if (existsSync(CONFIG)) {
+      const c = JSON.parse(readFileSync(CONFIG, "utf8"));
+      if (c && typeof c === "object" && !Array.isArray(c)) cfgCache = c;
     }
+  } catch {
+    // Malformed config: the built-in checks (2 and the token files) still run.
   }
+  return cfgCache;
+}
+
+// A leading "~/" means the home directory, so one config file reads the same on every machine.
+const expandHome = (p) => (/^~[\\/]/.test(p) ? join(homedir(), p.slice(2)) : p);
+
+function sources() {
+  const cfg = config();
+  if (Array.isArray(cfg?.sources)) return cfg.sources.filter((s) => typeof s === "string" && s).map(expandHome);
   return DEFAULT_SOURCES;
+}
+
+function unsafeOperations() {
+  const cfg = config();
+  const list = Array.isArray(cfg?.unsafe_operations) ? cfg.unsafe_operations : DEFAULT_UNSAFE_OPERATIONS;
+  const out = [];
+  list.forEach((e, i) => {
+    if (!e || typeof e !== "object" || typeof e.match !== "string" || typeof e.unsafe !== "string") return;
+    const id = typeof e.id === "string" && e.id ? e.id : "unsafe-operation-" + i;
+    try {
+      const match = new RegExp(e.match, "i");
+      const unsafe = new RegExp(e.unsafe, "i");
+      out.push({
+        id,
+        match,
+        unsafe: (c) => unsafe.test(c),
+        reason: typeof e.reason === "string" && e.reason
+          ? e.reason
+          : "Blocked by secret-guard rule '" + id + "' in " + CONFIG + " (the rule gives no reason).",
+      });
+    } catch {
+      // A regex that does not compile is a config mistake, not a reason to block or to crash.
+    }
+  });
+  return out;
 }
 
 // A short value would match everywhere and make the guard useless noise.
 const MIN_SECRET_LEN = 12;
 
-function secrets() {
+// The Agent Channel tokens themselves: every user has them, they are bearer credentials, and they cost one
+// readdir to find. Off with "scan_token_files": false in the config. Only the home store is scanned; the
+// legacy in-repo .tok files are not, so a relocated store (AGENTCHAN_HOME) never reaches outside itself.
+function tokenFileSecrets() {
   const out = [];
+  if (config()?.scan_token_files === false) return out;
+  try {
+    for (const f of readdirSync(HOME_STORE)) {
+      if (!/^tok\..+\.json$/i.test(f)) continue;
+      const path = join(HOME_STORE, f);
+      try {
+        if (statSync(path).size > 64 * 1024) continue;
+        const tok = JSON.parse(readFileSync(path, "utf8"))?.token;
+        if (typeof tok === "string" && tok.length >= MIN_SECRET_LEN) out.push({ value: tok, path, key: "token" });
+      } catch {
+        // Unreadable or not JSON: not a reason to block the command.
+      }
+    }
+  } catch {
+    // No store yet (nothing joined): nothing to guard.
+  }
+  return out;
+}
+
+function secrets() {
+  const out = tokenFileSecrets();
   for (const path of sources()) {
     try {
       if (!existsSync(path) || statSync(path).size > 64 * 1024) continue;
@@ -184,12 +238,12 @@ for (const s of secrets()) {
         `A secret on a command line is captured by shell history, npm/CLI argv logs, and this tool's own output, ` +
         `which is how it reaches a model provider. Pass it through an environment variable or stdin instead ` +
         `(for example: 'railway variables --set-from-stdin KEY', or export PGPASSWORD and drop the --password flag). ` +
-        `If the value genuinely must be inline, ask Johnathan to run the command himself.`
+        `If the value genuinely must be inline, ask the person you work for to run the command themselves.`
     );
   }
 }
 
-for (const op of UNSAFE_OPERATIONS) {
+for (const op of unsafeOperations()) {
   if (op.match.test(command) && op.unsafe(command)) deny(op.reason);
 }
 
@@ -197,7 +251,7 @@ const m = command.match(SECRET_FLAGS);
 if (m && !PLACEHOLDER.test(m[4]) && m[4].length >= 8) {
   deny(
     `Blocked: '--${m[2]}' is given an inline value. Credentials on a command line end up in argv logs and in ` +
-      `tool output that leaves the machine. Use an environment variable or stdin, or have Johnathan run it directly.`
+      `tool output that leaves the machine. Use an environment variable or stdin, or have the person you work for run it directly.`
   );
 }
 

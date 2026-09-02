@@ -11,6 +11,7 @@
 //   export-conversation [--last N] [--out file]       redacted transcript of the current Claude Code / Codex session
 //   call <tool> '<json>' [--runtime <key>]            call any MCP tool as that runtime's own agent
 //   verify <contract_id> ... [--runtime <key>]        run the exit gate checks for a return
+//   watchdog [--install|--uninstall|--status|--dry-run]   Windows: keep the resident listeners alive (scheduled task)
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
@@ -22,7 +23,7 @@ const map = {
   listen: ["scripts/listen.mjs"], send: ["scripts/artifact.mjs", "send"], fetch: ["scripts/artifact.mjs", "fetch"], keygen: ["scripts/artifact.mjs", "keygen"],
   rotate: ["scripts/artifact.mjs", "rotate"], "revoke-key": ["scripts/artifact.mjs", "revoke-key"], keys: ["scripts/artifact.mjs", "keys"],
   share: ["scripts/share.mjs"], publish: ["scripts/publish.mjs"], open: ["scripts/open-link.mjs"], "export-conversation": ["scripts/export-conversation.mjs"], call: ["scripts/cli.mjs"], verify: ["scripts/verify.mjs"],
-  "audit-verify": ["scripts/audit-verify.mjs"], guide: ["scripts/guide.mjs"],
+  "audit-verify": ["scripts/audit-verify.mjs"], guide: ["scripts/guide.mjs"], watchdog: ["scripts/listener-watchdog.mjs"],
 };
 if (!cmd || !map[cmd]) {
   console.log(`agent-channel <command>
@@ -47,6 +48,7 @@ if (!cmd || !map[cmd]) {
   verify <contract_id> ... [--runtime <key>]
   audit-verify [--record] <export.json>           offline: recheck a signed export's hashes, chain, signature
   guide [topic]                                   what this channel can do, by job (share, publish, handoff, teams, ...)
+  watchdog [--install|--uninstall|--status|--dry-run]   Windows: restart a listener that died mid-session (scheduled task, every 10 min)
 
 Server: ${process.env.AGENTCHAN_URL || "https://channel.amkentech.com"}   Tokens: ~/.agentchan/tok.<runtime>.json`);
   process.exit(cmd ? 1 : 0);

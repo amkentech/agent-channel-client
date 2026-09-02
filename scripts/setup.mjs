@@ -39,12 +39,74 @@ if (IN_NPX_CACHE && !process.env.AGENTCHAN_NO_SELF_INSTALL) {
   console.log("  installed client to " + CLIENT_HOME + " (hooks and the listener run from there; re-run join/wire from any npx to update)");
   REPO = CLIENT_HOME;
 }
-const BASE = (process.env.AGENTCHAN_URL || "https://channel.amkentech.com").replace(/\/mcp$/, "");
+// The canonical server. lib/paths.mjs BASE applies the same default inline and exports no constant for it, so
+// the literal lives here too; keep the two in step. doctor flags a BASE that differs from this.
+const DEFAULT_BASE = "https://channel.amkentech.com";
+const BASE = (process.env.AGENTCHAN_URL || DEFAULT_BASE).replace(/\/mcp$/, "");
 const args = process.argv.slice(2);
 const cmd = args[0];
 const opt = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : d; };
 const H = homedir();
 const WIN = platform() === "win32";
+// The scheduled task scripts/listener-watchdog.mjs registers (TASK there). A literal rather than an import:
+// that script runs its command on import.
+const WATCHDOG_TASK = "AgentChannelListenerWatchdog";
+
+/** The per-user Startup folder on Windows. AGENTCHAN_STARTUP_DIR overrides it so a test can hand wire and
+ *  doctor a temp folder; null where there is no such folder (macOS/Linux use LaunchAgent/systemd instead). */
+function startupDir() {
+  if (process.env.AGENTCHAN_STARTUP_DIR) return process.env.AGENTCHAN_STARTUP_DIR;
+  if (!WIN) return null;
+  return join(process.env.APPDATA || join(H, "AppData", "Roaming"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
+}
+const canonicalVbs = (key) => "agent-channel-" + key + ".vbs";
+const listenerKeys = () => Object.values(ADAPTERS).filter((a) => a.listener).map((a) => a.key);
+
+/** Every .vbs in the Startup folder that launches a listener, with the listener keys it references.
+ *  Read-only; returns [] when the folder is missing or unreadable. */
+function startupListenerEntries(startup) {
+  const out = [];
+  if (!startup) return out;
+  let names = []; try { names = readdirSync(startup); } catch { return out; }
+  for (const name of names) {
+    if (!/\.vbs$/i.test(name)) continue;
+    let text = ""; try { text = readFileSync(join(startup, name), "utf8"); } catch { continue; }
+    if (!text.includes("run_listen_")) continue;
+    const keys = listenerKeys().filter((k) => text.includes("run_listen_" + k + ".cmd"));
+    out.push({ name, file: join(startup, name), text, keys, canonical: listenerKeys().some((k) => name.toLowerCase() === canonicalVbs(k)) });
+  }
+  return out;
+}
+
+/** The hand-written AgentChannelListeners.vbs (byte-identical to the repo's start_listeners.vbs) launched every
+ *  listener at logon. Once wire writes the per-runtime agent-channel-<key>.vbs next to it, each listener starts
+ *  TWICE, and the watchdog then refuses to act because it cannot attribute the second process. This plans the
+ *  cleanup for `keys` -- the runtimes whose canonical entry exists (or is about to). Only a non-canonical .vbs
+ *  that references run_listen_ is ever touched, and only its run_listen_<key>.cmd lines go: a legacy file that
+ *  also launches something else (this machine's launches run_codex_appserver.cmd) is rewritten without the
+ *  listener lines rather than deleted, so nothing that is not a duplicate stops starting at logon. */
+function planLegacyStartupCleanup(startup, keys) {
+  const plan = [];
+  for (const e of startupListenerEntries(startup)) {
+    if (e.canonical) continue;
+    const dropped = e.keys.filter((k) => keys.includes(k));
+    if (!dropped.length) continue;
+    const isDup = (line) => dropped.some((k) => line.includes("run_listen_" + k + ".cmd"));
+    const kept = e.text.split(/\r?\n/).filter((line) => !isDup(line));
+    const launchesLeft = kept.some((line) => /\.Run\b/i.test(line));
+    plan.push({ ...e, dropped, action: launchesLeft ? "rewrite" : "delete", text: launchesLeft ? kept.join("\r\n") : "" });
+  }
+  return plan;
+}
+async function applyLegacyStartupCleanup(plan) {
+  const { rmSync } = await import("node:fs");
+  for (const p of plan) {
+    try {
+      if (p.action === "delete") { rmSync(p.file); ok("removed duplicate startup entry " + p.file + " (it started " + p.dropped.join(", ") + " a second time at logon)"); }
+      else { writeFileSync(p.file, p.text); ok("dropped the " + p.dropped.map((k) => "run_listen_" + k + ".cmd").join(", ") + " line(s) from " + p.file + " (a second logon start); its other launch lines are kept"); }
+    } catch (e) { warn("could not clean the duplicate startup entry " + p.file + ": " + e.message); }
+  }
+}
 
 /** Does this adapter's own hooksWire include the named hook script? doctor asks the adapter rather than keying on
  *  a runtime name, so a runtime that gains a seam is reported the day its adapter gains it. Returns false rather
@@ -371,6 +433,12 @@ async function wire(ad, explicitToken) {
     if (ad.hooksFile && hw.note) say("  note: " + hw.note);
     if (ad.commandsWire) { const cw = ad.commandsWire({ repo: REPO }); say("  would: install slash commands to " + cw.dir + " (" + cw.files.map((f) => cw.invokeAs(f)).join(", ") + ")"); }
     if (ad.listener) say("  would: install the listener to start at login (" + (WIN ? "Startup folder + run_listen_" + ad.key + ".cmd" : platform() === "darwin" ? "LaunchAgent com.agentchannel.listen." + ad.key : "systemd --user unit") + ") and start it now");
+    if (ad.listener && WIN) {
+      const startup = startupDir();
+      const present = startupListenerEntries(startup).filter((e) => e.canonical).map((e) => listenerKeys().find((k) => e.name.toLowerCase() === canonicalVbs(k)));
+      for (const p of planLegacyStartupCleanup(startup, [...new Set([ad.key, ...present])])) say("  would: " + (p.action === "delete" ? "remove" : "drop the " + p.dropped.map((k) => "run_listen_" + k + ".cmd").join(", ") + " line(s) from") + " duplicate startup entry " + p.file);
+      say("  would: " + (RELOCATED ? "skip the listener watchdog task (AGENTCHAN_HOME is set)" : "register the listener watchdog scheduled task " + WATCHDOG_TASK + " (every 10 min)"));
+    }
     return;
   }
 
@@ -444,14 +512,32 @@ async function wire(ad, explicitToken) {
   const cmdFile = join(REPO, "run_listen_" + ad.key + ".cmd");
   if (WIN) {
     if (!existsSync(cmdFile)) writeFileSync(cmdFile, "@echo off\r\ncd /d " + REPO + "\r\nnode scripts\\listen.mjs --runtime " + ad.key + " >> \"%USERPROFILE%\\.agentchan\\listen-" + ad.key + ".log\" 2>&1\r\n");
-    const startup = join(process.env.APPDATA || join(H, "AppData", "Roaming"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup");
-    const vbs = join(startup, "agent-channel-" + ad.key + ".vbs");
+    const startup = startupDir();
+    const vbs = join(startup, canonicalVbs(ad.key));
     try { mkdirSync(startup, { recursive: true }); writeFileSync(vbs, 'Set sh = CreateObject("WScript.Shell")\r\nsh.Run """' + cmdFile + '""", 0, False\r\n'); ok("listener starts at logon (" + vbs + ")"); }
     catch (e) { warn("could not write startup entry: " + e.message); }
+    // A legacy all-listeners .vbs next to the canonical one starts this listener twice at logon, and the
+    // watchdog then cannot attribute the second process and stops acting. Clean it for every runtime whose
+    // canonical entry now exists, never for one whose only logon start is the legacy file.
+    {
+      const present = startupListenerEntries(startup).filter((e) => e.canonical).map((e) => listenerKeys().find((k) => e.name.toLowerCase() === canonicalVbs(k)));
+      await applyLegacyStartupCleanup(planLegacyStartupCleanup(startup, [...new Set([ad.key, ...present])]));
+    }
     // start now if not running
     if (!chosen) warn("not starting the listener: it has no token to connect with");
     else if (!listenerFresh(ad)) { try { spawn("wscript", [vbs], { detached: true, stdio: "ignore", windowsHide: true }).unref(); ok("listener started now"); } catch { warn("start the listener: " + cmdFile); } }
     else ok("listener already running");
+    // The watchdog restarts a listener that dies mid-session (the Startup entry only ever starts it at logon).
+    // Registered through the script itself so there is one definition of the task; schtasks /F makes it
+    // idempotent. A relocated store is not this machine's primary identity and gets no machine-level task,
+    // the same rule that keeps it out of the user environment above.
+    if (RELOCATED) warn("AGENTCHAN_HOME is set, so the listener watchdog scheduled task is not registered for this store.");
+    else {
+      try {
+        execFileSync(process.execPath, [join(REPO, "scripts", "listener-watchdog.mjs"), "--install"], { cwd: REPO, stdio: "pipe", encoding: "utf8", timeout: 20000, windowsHide: true });
+        ok("listener watchdog installed (every 10 min)");
+      } catch (e) { warn("could not install the listener watchdog: " + String(e.stderr || e.stdout || e.message).trim().slice(0, 200) + "\n      run it yourself: npx @amkentech/agent-channel watchdog --install"); }
+    }
   } else if (platform() === "darwin") {
     // macOS: a per-user LaunchAgent keeps the listener alive across logins (KeepAlive) and starts it now
     const label = "com.agentchannel.listen." + ad.key;
@@ -508,7 +594,39 @@ function listenerFresh(ad) {
 // ---------------- doctor ----------------
 async function doctor() {
   say("Agent Channel doctor  (server " + BASE + ")");
+  // The first line has always printed BASE; it never said when BASE was not the real server, and an
+  // AGENTCHAN_URL left over from a test or a local build makes every check below report on the wrong machine.
+  if (BASE !== DEFAULT_BASE) warn("server URL overridden to " + BASE + " by AGENTCHAN_URL; the canonical address is " + DEFAULT_BASE);
   try { const h = await api("/health"); ok("server reachable, listeners connected: " + h.listeners); } catch (e) { bad("server unreachable: " + e.message); }
+  // A credential file named for a runtime no adapter knows is invisible to every path that resolves tokens by
+  // adapter key (tok.copilot-cli.json on this machine, while the key is copilot): the runtime it was minted
+  // for runs unwired, and the token sits on disk unused and unchecked.
+  {
+    let files = []; try { files = readdirSync(HOME_STORE).filter((f) => /^tok\..+\.json$/.test(f)); } catch {}
+    const known = Object.keys(ADAPTERS);
+    for (const f of files) {
+      const key = f.slice("tok.".length, -".json".length);
+      if (!known.includes(key)) warn(join(HOME_STORE, f) + " holds a credential for unknown runtime '" + key + "'; known keys: " + known.join(", ") + "; rename it to tok.<key>.json for the runtime it belongs to, or delete it");
+    }
+  }
+  // Windows logon starts: a listener referenced by two Startup entries runs twice, and the watchdog refuses to
+  // act on a process it cannot attribute. Then the watchdog task itself, without which a listener that dies
+  // mid-session stays dead until the next logon.
+  {
+    const startup = startupDir();
+    const entries = startupListenerEntries(startup);
+    for (const k of listenerKeys()) {
+      const refs = entries.filter((e) => e.keys.includes(k));
+      if (refs.length > 1) bad("listener '" + k + "' is started " + refs.length + " times at logon (" + refs.map((e) => e.name).join(", ") + "); run: npx @amkentech/agent-channel wire --runtime " + k);
+    }
+    if (WIN && RELOCATED) warn("listener watchdog check skipped (AGENTCHAN_HOME is set; the task belongs to the machine's primary store)");
+    else if (WIN) {
+      let installed = false;
+      try { execFileSync("schtasks", ["/Query", "/TN", WATCHDOG_TASK], { stdio: "pipe", windowsHide: true, timeout: 15000 }); installed = true; } catch {}
+      if (installed) ok("listener watchdog scheduled task present (" + WATCHDOG_TASK + ")");
+      else warn("listener watchdog not installed; a listener that dies mid-session stays dead until logon. Fix: npx @amkentech/agent-channel watchdog --install");
+    }
+  }
   // A stored credential is checkable whether or not its CLI is. Gating every check on detect() made doctor
   // blind to the thing it exists to find: a live token on a machine where the client is not detectable (not
   // on PATH, or not installed at all -- on the CI runner three doctor tests failed for exactly this reason:
