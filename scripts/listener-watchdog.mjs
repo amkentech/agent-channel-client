@@ -132,15 +132,20 @@ function startListener(rt) {
 // duration, so a "every 10 minutes forever" trigger quietly stops after a day.
 function install() {
   const wrapper = join(ROOT, "run_listener_watchdog.cmd");
+  const vbs = join(ROOT, "run_listener_watchdog_hidden.vbs");
   // the wrapper keeps the task definition to one quoted path, and sends its own output to the same log
   // ROOT is wherever this script runs from: the git checkout, or ~/.agentchan/client when setup installed the
   // package from npx (setup.mjs re-runs from that copy, so `wire` registers the task against it). Quoted: a
   // home directory with a space in it ("C:\Users\Jo Smith\.agentchan\client") breaks an unquoted cd.
   const body = "@echo off\r\ncd /d \"" + ROOT + "\"\r\nnode scripts\\listener-watchdog.mjs >> \"%USERPROFILE%\\.agentchan\\watchdog.log\" 2>&1\r\n";
-  if (DRY) { log("would write " + wrapper + " and register scheduled task " + TASK + " every 10 min"); return; }
+  // schtasks shows a console window for a .cmd/.exe action by default; wrapping it in a hidden VBS launcher
+  // (windowStyle 0) is the same trick the per-runtime Startup entries already use to start silently.
+  const vbsBody = "Set sh = CreateObject(\"WScript.Shell\")\r\nsh.Run \"\"\"" + wrapper + "\"\"\", 0, True\r\n";
+  if (DRY) { log("would write " + wrapper + ", " + vbs + " and register scheduled task " + TASK + " every 10 min"); return; }
   writeFileSync(wrapper, body);
-  const a = ["/Create", "/TN", TASK, "/TR", '"' + wrapper + '"', "/SC", "MINUTE", "/MO", "10", "/F"];
-  try { execFileSync("schtasks", a, { stdio: "pipe", encoding: "utf8" }); log("installed scheduled task " + TASK + " (every 10 minutes) -> " + wrapper); }
+  writeFileSync(vbs, vbsBody);
+  const a = ["/Create", "/TN", TASK, "/TR", 'wscript.exe "' + vbs + '"', "/SC", "MINUTE", "/MO", "10", "/F"];
+  try { execFileSync("schtasks", a, { stdio: "pipe", encoding: "utf8" }); log("installed scheduled task " + TASK + " (every 10 minutes) -> " + vbs + " (hidden)"); }
   catch (e) { log("could not register the task: " + String(e.stderr || e.message).slice(0, 200)); process.exitCode = 1; }
 }
 

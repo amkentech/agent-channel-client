@@ -1,0 +1,34 @@
+{
+  "_doc": "Data, not code: which coding-agent runtimes the receipt check and the post-commit sighting hook recognise. co_authored_by = case-insensitive regexes tried against each Co-Authored-By trailer value ('Name <email>'). identity_vars = env var NAMES that identify the runtime as the innermost one, session-id first; session_var is the one whose value becomes session_id in a sighting. markers = every env var NAME recorded in a sighting (names only, never values). Env markers verified 2026-09-24 per docs/RECEIPTS.md 'Runtime markers'. innermost_priority: when several runtimes' identity vars are present, the first listed wins, because markers inherit into nested sessions and Claude Code's were observed leaking into a Codex child, so Claude is last. AI_AGENT is recorded but never identifies a runtime on its own.",
+  "innermost_priority": ["copilot", "codex", "gemini", "claude"],
+  "runtimes": [
+    {
+      "key": "claude", "label": "Claude Code",
+      "co_authored_by": ["noreply@anthropic\\.com", "^claude\\b"],
+      "markers": ["CLAUDECODE", "AI_AGENT", "CLAUDE_CODE_SESSION_ID"],
+      "identity_vars": ["CLAUDE_CODE_SESSION_ID", "CLAUDECODE"],
+      "session_var": "CLAUDE_CODE_SESSION_ID"
+    },
+    {
+      "key": "codex", "label": "Codex (OpenAI)",
+      "co_authored_by": ["\\bcodex\\b", "@openai\\.com", "^openai\\b", "chatgpt"],
+      "markers": ["CODEX_SESSION_ID", "CODEX_THREAD_ID", "CODEX_CI", "CODEX_SANDBOX_NETWORK_DISABLED"],
+      "identity_vars": ["CODEX_SESSION_ID", "CODEX_THREAD_ID"],
+      "session_var": "CODEX_SESSION_ID"
+    },
+    {
+      "key": "copilot", "label": "GitHub Copilot",
+      "co_authored_by": ["\\bcopilot\\b", "copilot-swe-agent"],
+      "markers": ["COPILOT_CLI", "COPILOT_AGENT_SESSION_ID"],
+      "identity_vars": ["COPILOT_AGENT_SESSION_ID", "COPILOT_CLI"],
+      "session_var": "COPILOT_AGENT_SESSION_ID"
+    },
+    {
+      "key": "gemini", "label": "Gemini",
+      "co_authored_by": ["\\bgemini\\b", "gemini-code-assist"],
+      "markers": ["GEMINI_CLI"],
+      "identity_vars": ["GEMINI_CLI"],
+      "session_var": null
+    }
+  ]
+}

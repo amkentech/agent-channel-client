@@ -14,7 +14,10 @@
 //  - Read only local files the resident listener maintains. A hook that runs after EVERY tool call must never
 //    touch the network; the listener already did.
 //  - Say each thing exactly once. A cursor file records the last event line reported, so a long turn does not
-//    re-announce the same message on every subsequent tool call.
+//    re-announce the same message on every subsequent tool call. On a machine running more than one resident
+//    listener (claude AND codex), each listener appends the same server event to the same per-handle file, so
+//    the reader also dedupes: a stable key per event, and the last few keys kept in the cursor so a duplicate
+//    that lands on the far side of a cursor boundary is still recognised.
 //  - Stay silent when nothing arrived, which is almost always. Silence is what makes it tolerable at this rate.
 //  - Never block, never fail loudly: any error exits 0 with no output.
 import { readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
@@ -49,12 +52,27 @@ try { lines = readFileSync(eventsFile, "utf8").split("\n").filter((l) => l.trim(
 
 // First run on an existing session: adopt the current position silently rather than dumping the backlog into
 // the middle of a turn. The waiting report at the next prompt (inbox.mjs) is the right place for history.
-const save = (n) => { try { writeFileSync(cursorFile, JSON.stringify({ count: n, mtime })); } catch {} };
-if (!cursor) { save(lines.length); quit(); }
+// The dedupe key: what identifies one server event regardless of which listener wrote the line. `at` is the
+// server's stamp, so two different events that share it still differ on id or summary.
+const SEEN_MAX = 50;
+const keyOf = (e) => [e.type || "", e.from || "", e.message_id || e.artifact_id || e.connection_id || e.summary || "", e.at || ""].join("|");
+const parse = (ls) => ls.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+// A cursor written before `seen` existed has none; an empty list keeps it working unchanged.
+const prevSeen = Array.isArray(cursor?.seen) ? cursor.seen.filter((k) => typeof k === "string") : [];
+const save = (n, seen = prevSeen) => { try { writeFileSync(cursorFile, JSON.stringify({ count: n, mtime, seen: seen.slice(-SEEN_MAX) })); } catch {} };
+// Adopting also remembers the tail, so a second listener re-writing one of those lines is not "new".
+if (!cursor) { save(lines.length, parse(lines.slice(-SEEN_MAX)).map(keyOf)); quit(); }
 if (lines.length <= cursor.count) { save(lines.length); quit(); }
 
-const fresh = lines.slice(cursor.count).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-save(lines.length);
+const seen = new Set(prevSeen);
+const fresh = [];
+for (const e of parse(lines.slice(cursor.count))) {
+  const k = keyOf(e);
+  if (seen.has(k)) continue;
+  seen.add(k);
+  fresh.push(e);
+}
+save(lines.length, prevSeen.concat(fresh.map(keyOf)));
 if (!fresh.length) quit();
 
 // Describe an event the way the human would say it out loud. The full item is always one my_inbox away; this is
@@ -69,6 +87,7 @@ const describe = (e) => {
     case "human":   return "MESSAGE from " + who + via + ": " + (e.text || s);
     case "blocked": return "BLOCKED QUESTION from " + who + (e.human_only ? " (HUMAN-ONLY — for " + me + " to answer, not you)" : "") + ": " + s;
     case "connect": return "CONNECTION REQUEST from " + who + " (" + me + " decides): " + s;
+    case "connected": return "CONNECTED: " + s;   // already accepted (an invite redeemed); nothing to decide
     case "contract":return "CONTRACT from " + who + ": " + s;
     case "artifact":return "FILE from " + who + ": " + s + " (the listener has decrypted it into ~/.agentchan/" + handle + "/inbox/)";
     case "team":    return "TEAM: " + s + (who ? " — from " + who : "");
@@ -81,6 +100,7 @@ const describe = (e) => {
 const shown = fresh.slice(-MAX_REPORT);
 const extra = fresh.length - shown.length;
 const body = shown.map((e) => "- " + describe(e)).join("\n") + (extra ? "\n- (and " + extra + " earlier item(s) — my_inbox has them all)" : "");
+// "connect" is a pending request the human decides; "connected" is the already-accepted invite join, not a decision.
 const humanOnly = fresh.some((e) => e.human_only || e.type === "connect");
 
 process.stdout.write(JSON.stringify({

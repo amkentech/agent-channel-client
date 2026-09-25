@@ -3,7 +3,9 @@
 //   node scripts/audit-verify.mjs export.json                       audit_trail mode=export (signed wrapper or bare)
 //   node scripts/audit-verify.mjs --record record.json               export_contract / GET /c/:id/record.json
 //   node scripts/audit-verify.mjs --disclosure disclosure.json        disclose_contract / GET /c/:id/disclosure.json (any subset of facts)
-//   options: --pubkey <pem file> | --pubkey-url <url> (default: the server named in the export), --no-sig (skip signature)
+//   node scripts/audit-verify.mjs --receipt <file|url>               GET /receipts/<id>.json (signature, digest, every fact's proof)
+//   node scripts/audit-verify.mjs --declaration <file|url>           GET /declarations/<id>.json (signature, digest)
+//   options: --pubkey|--public-key <pem file> | --pubkey-url <url> (default: the server named in the export), --no-sig (skip signature)
 // Checks: every ledger row's hash from its canonical string, every visible chain link, and (if present) the server's Ed25519
 // signature over the sha256 of the canonical JSON body, against a public key you supply or fetch. Pin the key out of band
 // if this matters to you: a key fetched from the same server proves only that the server signed it.
@@ -12,8 +14,43 @@ import { createHash, createPublicKey, verify as edVerify } from "node:crypto";
 
 const args = process.argv.slice(2);
 const opt = (k) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
-const file = args.find((a, i) => !a.startsWith("--") && args[i - 1] !== "--pubkey" && args[i - 1] !== "--pubkey-url");
-if (!file) { console.error("usage: audit-verify.mjs [--record|--disclosure] <file.json> [--pubkey file.pem | --pubkey-url url | --no-sig]"); process.exit(1); }
+const file = args.find((a, i) => !a.startsWith("--") && !["--pubkey", "--pubkey-url", "--public-key", "--server"].includes(args[i - 1]));
+if (!file) { console.error("usage: audit-verify.mjs [--record|--disclosure|--receipt|--declaration] <file.json|url> [--pubkey file.pem | --public-key file.pem | --pubkey-url url | --no-sig]"); process.exit(1); }
+
+// ---- authorization receipts and Human-Authored declarations (docs/RECEIPTS.md "Wire contract") ----
+// Offline: digest, Ed25519 signature, and (receipts) every fact's salted Merkle proof to the signed root. The key is
+// pinned with --public-key/--pubkey; otherwise it is fetched from --pubkey-url or the server (--server, default the
+// live one) and the output says it was NOT pinned. The revocation question is online and belongs to `receipt check`.
+if (args.includes("--receipt") || args.includes("--declaration")) {
+  const rv = await import("../lib/receipt-verify.mjs");
+  let d;
+  try { d = await rv.loadJson(file); } catch (e) { console.error("cannot read " + file + ": " + e.message); process.exit(1); }
+  const isReceipt = args.includes("--receipt");
+  const pinnedFile = opt("--public-key") || opt("--pubkey");
+  let pem = null;
+  if (args.includes("--no-sig")) console.log("signature check skipped (--no-sig): only the digest and proofs below mean anything");
+  else if (pinnedFile) { const k = await rv.resolvePublicKey({ publicKeyFile: pinnedFile }); pem = k.pem; console.log(k.error ? k.error : "public key pinned: " + k.from); }
+  else if (opt("--pubkey-url")) {
+    try { const j = await (await fetch(opt("--pubkey-url"), { signal: AbortSignal.timeout(10000) })).json(); pem = j.public_key_pem; console.log(rv.NOT_PINNED_NOTE + " (" + opt("--pubkey-url") + ")"); }
+    catch (e) { console.log("could not fetch the public key (" + e.message + ")"); }
+  } else {
+    const fromUrl = /^https?:\/\//i.test(file) ? new URL(file).origin : null;
+    const k = await rv.resolvePublicKey({ server: opt("--server") || fromUrl || process.env.AGENTCHAN_URL });
+    pem = k.pem; console.log(k.error ? k.error : rv.NOT_PINNED_NOTE + " (" + k.from + ")");
+  }
+  const res = isReceipt ? rv.verifyReceiptDoc(d, pem) : rv.verifyDeclarationDoc(d, pem);
+  const problems = args.includes("--no-sig") ? res.problems.filter((p) => !/signature|public key|unsigned/.test(p)) : res.problems;
+  const b = res.body || {};
+  if (isReceipt && b.format) {
+    const n = Array.isArray(b.facts) ? b.facts.length : 0;
+    console.log("receipt " + b.receipt_id + " issued " + b.issued_at + ", root " + String(b.root).slice(0, 16) + "…, " + n + " fact(s): " + (b.facts || []).map((f) => f.k).join(", "));
+    if (res.binding) console.log("  binding: " + res.binding.repo + ", " + (res.binding.commits || []).length + " commit(s): " + (res.binding.commits || []).map((c) => String(c.sha).slice(0, 12) + " [" + (c.paths || []).length + " path(s)]").join(", "));
+    if (res.scope) console.log("  scope: repos " + JSON.stringify(res.scope.repos || []) + ", paths " + JSON.stringify(res.scope.paths || []) + (res.scope.expires_at ? ", expires " + res.scope.expires_at : ""));
+  } else if (b.format) console.log("declaration " + b.declaration_id + " by " + b.person + " issued " + b.issued_at + " for " + b.repo + ", " + (b.commits || []).length + " commit(s)");
+  for (const p of problems) console.log("PROBLEM: " + p);
+  console.log(problems.length ? "FAIL: " + problems.length + " problem(s)" : "OK" + (isReceipt ? " (signature, digest, and every fact's proof; revocation is checked online by `agent-channel receipt check`)" : " (signature and digest)"));
+  process.exit(problems.length ? 2 : 0);
+}
 let doc = JSON.parse(readFileSync(file, "utf8"));
 if (doc.content?.[0]?.text) doc = JSON.parse(doc.content[0].text); // raw MCP tool result
 
@@ -60,7 +97,7 @@ let problems = 0;
 
 // ---- 1. ledger rows (audit export: body.entries; contract record: body.timeline has hash+prev_hash but no canonical) ----
 const canonJson = (v) => v === null || v === undefined || typeof v !== "object" ? JSON.stringify(v === undefined ? null : v) : v instanceof Date ? JSON.stringify(v.toISOString()) : Array.isArray(v) ? "[" + v.map((x) => (x === undefined ? "null" : canonJson(x))).join(",") + "]" : "{" + Object.keys(v).filter((k) => v[k] !== undefined).sort().map((k) => JSON.stringify(k) + ":" + canonJson(v[k])).join(",") + "}";
-const canonical = (e) => e.canonical ?? ((e.prev_hash ?? "") + "|" + String(e.seq) + "|" + e.at_canon + "|" + (e.actor_person ?? "") + "|" + (e.actor_agent ?? "") + "|" + (e.subject_person ?? "") + "|" + e.action + "|" + (e.object_type ?? "") + "|" + (e.object_id ?? "") + "|" + e.payload_text);
+const canonical = (e) => e.canonical ?? ((e.prev_hash ?? "") + "|" + String(e.seq) + "|" + e.at_canon + "|" + (e.actor_person ?? "") + "|" + (e.actor_agent ?? "") + "|" + (e.subject_person ?? "") + "|" + e.action + "|" + (e.object_type ?? "") + "|" + (e.object_id ?? "") + "|" + e.payload_text + (e.policy_version ? "|pv:" + e.policy_version : ""));
 const entries = (body.entries || body.timeline || []).slice().sort((a, b) => Number(a.seq) - Number(b.seq));
 if (entries.length) {
   let bad = 0, links = 0, gaps = 0, hashed = 0;
