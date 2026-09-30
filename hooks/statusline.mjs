@@ -9,9 +9,10 @@ import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { trustedPeek } from "../lib/peek-cache.mjs";
+import { readClaims, readSession, routeFor, routePeek, threadOfItem } from "../lib/claim.mjs";
 
 const runtime = (process.argv[2] || "claude").toLowerCase();
-const root = join(homedir(), ".agentchan");
+const root = process.env.AGENTCHAN_HOME || join(homedir(), ".agentchan");
 let input = {};
 try {
   const raw = await new Promise((res) => {
@@ -35,6 +36,16 @@ let peek = null;
 // sibling-written file omits this runtime's handoffs and mislabels for_this_runtime, so a mismatch reads
 // as "no listener data", which is what the trailing "(listener?)" already means.
 try { peek = trustedPeek(JSON.parse(readFileSync(join(root, handle, "peek.json"), "utf8")), runtime); } catch {}
+// Session isolation (lib/claim.mjs): the line details only what routes to THIS session; everything else is a count.
+// Read-only - the status line redraws constantly and never claims. No session id -> the old whole-runtime view.
+const sid = typeof input.session_id === "string" && input.session_id ? input.session_id : null;
+let elsewhere = 0, isMine = () => true;
+if (sid) {
+  if (readSession(root, handle, runtime, sid).muted) { console.log(base); process.exit(0); }
+  const claims = readClaims(root, handle, runtime);
+  isMine = (key) => { const d = routeFor(claims, key); return !d || d === sid; };
+  if (peek) ({ mine: peek, elsewhere } = routePeek(peek, isMine, handle));
+}
 const items = peek?.items || [];
 const humans = items.filter((i) => i.type === "human");
 const humanOnly = items.filter((i) => i.human_only && i.type !== "human");
@@ -47,7 +58,7 @@ try {
   const seenF = join(root, handle, "artifacts.seen");
   const seen = new Set(existsSync(seenF) ? readFileSync(seenF, "utf8").split("\n").filter(Boolean) : []);
   for (const l of readFileSync(join(root, handle, "artifacts.jsonl"), "utf8").split("\n").filter(Boolean)) {
-    try { const r = JSON.parse(l); if (!seen.has(r.id)) { files++; lastFile = r; } } catch {}
+    try { const r = JSON.parse(l); if (!seen.has(r.id)) { if (isMine(threadOfItem({ from: r.from }, handle))) { files++; lastFile = r; } else elsewhere++; } } catch {}
   }
 } catch {}
 
@@ -62,5 +73,6 @@ if (hands.length) { const t = String(hands[hands.length - 1].text || "").replace
 if (props) parts.push("\u{1F4CB} " + props + " proposal" + (props > 1 ? "s" : "") + " for you");
 if (humanOnly.length) parts.push("\u26A0 " + humanOnly.length + " needs YOU (human-only)");
 const online = peek ? "" : " (listener?)";
+if (!parts.length && elsewhere) parts.push(elsewhere + " waiting in your channel session (`@channel here` takes them)");
 
 console.log(parts.length ? "[Agent Channel @" + handle + "] " + parts.join("  \u2502  ") : base + "  [Agent Channel @" + handle + ": clear" + online + "]");

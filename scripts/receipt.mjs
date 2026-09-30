@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 // agent-channel receipt <subcommand>   authorization receipts for agent-authored commits (docs/RECEIPTS.md)
 //
-//   check <base>..<head> [--json] [--strict --protected <glob,...>] [--public-key <pem>] [--server <url>]
+//   check <base>..<head> [--json] [--protected <glob,...>] [--public-key <pem>] [--server <url>]
 //         [--allow-offline] [--repo host/owner/name] [--pr-body <text>] [--runtime <key>] [--report-only]
-//         exit 0 = pass, 1 = fail, 2 = usage/error; --report-only prints the same result and exits 0 on a fail
+//         ENFORCED (strict) by default: every commit needs a valid receipt (agent) or Human-Authored declaration
+//         (person); --protected narrows the declaration requirement to those globs; --strict is accepted, a no-op.
+//         exit 0 = pass, 1 = fail, 2 = usage/error; --report-only prints the same result and exits 0 on a fail,
+//         and lets an undeclared, unmarked commit pass as human (flagged "unknown provenance")
 //   mint (--contract <id> | --grant <id>) <base>..<head> [--repo ..] [--runtime <key>]   -> prints the Agent-Receipt trailer
 //   declare <base>..<head> --attestation "<the human's own words>" [--repo ..] [--runtime <key>]  -> Human-Authored trailer
 //   install-hook [repo path] [--uninstall]      post-commit sighting hook for ONE repo; chains any existing hook
@@ -32,7 +35,7 @@ const server = String(opt["--server"] || BASE).replace(/\/mcp\/?$/, "").replace(
 function usage(msg) {
   if (msg) console.error("error: " + msg);
   console.error(`usage: agent-channel receipt <subcommand>
-  check <base>..<head> [--json] [--strict --protected <glob,...>] [--public-key <pem>] [--server <url>] [--allow-offline] [--repo host/owner/name] [--pr-body <text>] [--runtime <key>] [--report-only]
+  check <base>..<head> [--json] [--protected <glob,...>] [--public-key <pem>] [--server <url>] [--allow-offline] [--repo host/owner/name] [--pr-body <text>] [--runtime <key>] [--report-only]
   mint (--contract <id> | --grant <id>) <base>..<head> [--repo host/owner/name] [--runtime <key>]
   declare <base>..<head> --attestation "<the human's own words>" [--repo host/owner/name] [--runtime <key>]
   install-hook [repo path] [--uninstall]
@@ -72,15 +75,15 @@ if (sub === "check") {
   const { parseRange } = await import("../lib/receipt-git.mjs");
   const range = pos[0];
   if (!parseRange(range)) usage("expected a commit range <base>..<head>, got " + JSON.stringify(range ?? ""));
-  if (opt["--strict"] && !opt["--protected"]) usage("--strict needs --protected <glob,...>");
-  if (opt["--protected"] && !opt["--strict"]) usage("--protected only applies with --strict");
+  // Strict is the only enforced mode (docs/RECEIPTS.md "Enforcement"); --strict is kept so existing CI lines still run.
+  if (typeof opt["--protected"] === "string" && !opt["--protected"].split(",").some((x) => x.trim())) usage("--protected needs <glob,...> (omit it to protect every path)");
   const { checkRange, formatHuman } = await import("../lib/receipt-check.mjs");
   let res;
   try {
     res = await checkRange({
       cwd: process.cwd(), range, server, publicKeyFile: opt["--public-key"] || opt["--pubkey"] || null,
-      token: tokenFor(runtime), allowOffline: !!opt["--allow-offline"], strict: !!opt["--strict"],
-      protectedGlobs: opt["--protected"] ? String(opt["--protected"]).split(",").map((s) => s.trim()) : [],
+      token: tokenFor(runtime), allowOffline: !!opt["--allow-offline"], reportOnly: !!opt["--report-only"],
+      protectedGlobs: opt["--protected"] ? String(opt["--protected"]).split(",").map((s) => s.trim()).filter(Boolean) : [],
       repo: opt["--repo"] || null, prBody: typeof opt["--pr-body"] === "string" ? opt["--pr-body"] : null,
       timeoutMs: opt["--timeout-ms"] ? Number(opt["--timeout-ms"]) : undefined,
     });
@@ -91,8 +94,9 @@ if (sub === "check") {
     process.exit(2);
   }
   console.log(opt["--json"] ? JSON.stringify(res, null, 2) : formatHuman(res));
-  // --report-only: the full result above, then exit 0 whatever the verdict. For adopting the check on a repo whose
-  // history predates receipts. It relaxes the verdict only: usage and git/runtime errors above still exit 2.
+  // --report-only: the full result above, then exit 0 whatever the verdict. The explicit opt-out from enforcement, for
+  // adopting the check on a repo whose history predates receipts (this repo's dogfood workflow runs it until Johnathan
+  // flips it). It relaxes the verdict only: usage and git/runtime errors above still exit 2.
   // --json output is left byte-identical (parse `ok` yourself); the human form gets one closing line.
   if (opt["--report-only"]) {
     if (!opt["--json"]) console.log("REPORT-ONLY: verdict " + (res.ok ? "PASS" : "FAIL") + " is reported, not enforced (exit 0).");
@@ -119,6 +123,11 @@ else if (sub === "declare") {
   if (typeof words !== "string" || !words.trim()) usage("declare needs --attestation \"<the human's own words>\"");
   const { repo, commits } = await rangeCommits(pos[0]);
   const r = await mcpCall("declare_authorship", { repo, commits: commits.map((x) => ({ sha: x.sha, patch_id: x.patch_id })), attestation: words });
+  if (r.parsed?.status === "pending_human") {
+    // passkey step-up (server policy): the person confirms in a browser; the trailer is in step_up_status afterwards
+    console.error("This declaration needs you to confirm it with your passkey. Open:\n  " + r.parsed.confirm_url + "\nThen ask your agent for step_up_status " + r.parsed.request_id + " (its result carries the Human-Authored trailer).");
+    process.exit(2);
+  }
   if (r.isError || !r.parsed?.declaration_id) { console.error("declare_authorship refused: " + r.text); process.exit(1); }
   console.log(r.parsed.trailer || ("Human-Authored: " + r.parsed.declaration_id));
   console.error("declaration " + r.parsed.declaration_id + " covers " + commits.length + " commit(s) in " + repo);

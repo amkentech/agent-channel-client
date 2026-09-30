@@ -28,6 +28,9 @@ import { splitSurfaced } from "../lib/surfaced.mjs";
 import { trustedPeek } from "../lib/peek-cache.mjs";
 import { diag } from "../lib/diag.mjs";
 import { buildBanner } from "../lib/banner.mjs";
+import { staleClientNotice, versionAt } from "../lib/client-version.mjs";
+import { maybeCheckLedger, ledgerAlerts, alertLine } from "../lib/ledger-head.mjs";
+import { parseChannelCommand, applyCommand, readClaims, writeClaims, readSession, writeSession, resolve as resolveClaim, routeFor, routePeek, removeFromPeek, threadOfItem, countLine, shouldShowCount, pruneSessions, cursorAtEnd } from "../lib/claim.mjs";
 
 const runtime = (process.argv[2] || "claude").toLowerCase();
 let eventName = process.argv[3] || "";
@@ -53,8 +56,9 @@ try {
 } catch {}
 if (!eventName) eventName = input.hook_event_name || "UserPromptSubmit";
 
-const root = join(homedir(), ".agentchan");
-try { mkdirSync(root, { recursive: true }); } catch {}
+// AGENTCHAN_HOME relocates the store (lib/paths.mjs HOME_STORE rule); the claims files live in it too.
+const root = process.env.AGENTCHAN_HOME || join(homedir(), ".agentchan");
+try { mkdirSync(root, { recursive: true, mode: 0o700 }); } catch {}
 const out = (obj) => { process.stdout.write(JSON.stringify(obj)); process.exit(0); };
 
 // ---- who am I locally (from the listener's marker) ----
@@ -67,6 +71,28 @@ try {
 
 // ================= 1. FAST PATH =================
 const prompt = typeof input.prompt === "string" ? input.prompt : "";
+const sessionId = typeof input.session_id === "string" && input.session_id ? input.session_id : null;
+// `@channel here | take @x | drop @x | off | status`: session routing, handled here with no model turn, like
+// an @handle send. Checked before the @handle form, which would otherwise read "@channel" as a person.
+const chanCmd = eventName === "UserPromptSubmit" ? parseChannelCommand(prompt, myHandle) : null;
+if (chanCmd) {
+  let receipt;
+  if (!myHandle) receipt = "[Agent Channel] not set up on this machine (no listener identity yet); nothing to route";
+  else if (!sessionId) receipt = "[Agent Channel] this host sends no session id, so every session gets the channel; @channel commands need a newer host";
+  else {
+    const r = applyCommand({ claims: readClaims(root, myHandle, runtime), session: readSession(root, myHandle, runtime, sessionId), sessionId, cwd: input.cwd, cmd: chanCmd.cmd, key: chanCmd.key });
+    if (chanCmd.cmd !== "status") {
+      writeClaims(root, myHandle, runtime, r.claims);
+      // a session that becomes a destination starts its mid-turn cursor here, like a first prompt would
+      if (!r.session.btw) r.session.btw = cursorAtEnd(join(root, myHandle, "events.jsonl"));
+      writeSession(root, myHandle, runtime, sessionId, r.session);
+    }
+    receipt = r.receipt;
+  }
+  const agentNote = "The user's prompt was an Agent Channel routing command, already handled by the hook with no model involvement: " + receipt + ". Do not call any tool for it.";
+  if (runtime === "claude") out({ decision: "block", reason: receipt, systemMessage: receipt, hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: agentNote } });
+  out({ systemMessage: receipt, hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: agentNote + " Reply with exactly this line and nothing else: " + receipt.replace(/^\[Agent Channel\]\s*/, "Agent Channel · ") } });
+}
 if (eventName === "UserPromptSubmit" && prompt) {
   // a handle is followed by whitespace, light punctuation, or end of line; "@src/auth/login.ts why" and "@README.md ..." are file
   // mentions, not people, so a following / . \ or anything else leaves the prompt alone
@@ -74,6 +100,23 @@ if (eventName === "UserPromptSubmit" && prompt) {
   if (m) {
     const to = m[1].toLowerCase();
     const rest = m[2].trim();
+    // "@me (codex) run the migration": a handoff the human TYPED, sent with no model turn. This is the only path
+    // that records via "typed"; one made by the handoff tool is agent-created and the target surfaces it as a request.
+    const selfHand = to === myHandle ? rest.match(/^\(([a-z0-9][a-z0-9._-]{1,39})\)\s+([\s\S]+)$/i) : null;
+    if (selfHand) {
+      let receipt, ok = false;
+      try {
+        const r = await fetch(url + "/handoff", { method: "POST", headers: H, body: JSON.stringify({ to_runtime: selfHand[1], text: selfHand[2].trim() }), signal: AbortSignal.timeout(8000) });
+        const j = await r.json().catch(() => ({}));
+        if (r.ok) { receipt = "[Agent Channel] handed to " + (j.for_runtime || selfHand[1]) + ": " + (selfHand[2].length > 140 ? selfHand[2].slice(0, 140) + "..." : selfHand[2].trim()); ok = true; }
+        else receipt = "[Agent Channel] handoff NOT delivered to " + selfHand[1] + ": " + (j.error || r.status);
+      } catch (e) { receipt = "[Agent Channel] handoff NOT delivered to " + selfHand[1] + ": " + e.message; }
+      const agentNote = ok
+        ? "The user's prompt was a handoff to their " + selfHand[1] + " session. The Agent Channel hook already delivered it with no model involvement. Do NOT send it again with any tool."
+        : "The user's prompt was a handoff to their " + selfHand[1] + " session but the hook could not deliver it: " + receipt + ". Tell the user.";
+      if (runtime === "claude") out({ decision: "block", reason: receipt, systemMessage: receipt, hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: agentNote } });
+      out({ systemMessage: receipt, hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: agentNote + " Reply with exactly this line and nothing else: " + (ok ? "✓ " : "✗ ") + receipt.replace(/^\[Agent Channel\]\s*/, "Agent Channel · ") } });
+    }
     if (to !== myHandle && rest) {
       let receipt, ok = false, agentNote;
       // "@sam send-conversation [--last N] [--since "auth bug"] [note]"
@@ -132,7 +175,38 @@ if (eventName === "UserPromptSubmit" && prompt) {
   }
 }
 
+// ================= 1b. SESSION ROUTING =================
+// Which of this runtime's sessions gets what (lib/claim.mjs). No session id (an old host) or no identity yet ->
+// legacy: everything below behaves exactly as before and no claim is read or written. A muted session (typed
+// `@channel off`) gets nothing at all, and does not even look.
+const sess = myHandle ? resolveClaim(root, myHandle, runtime, { sessionId, cwd: input.cwd, autoHome: true }) : { legacy: true };
+if (sess.muted) process.exit(0);
+if (!sess.legacy && eventName === "SessionStart") pruneSessions(root, myHandle, runtime);
+// Move this session's mid-turn cursor to the end of the event log. This report covers everything waiting up to
+// now, so an event that arrived while the session was idle must not be announced AGAIN by btw on the first tool
+// call of the turn (it was: banner in full, then the same body mid-turn). Seeding it here also means btw's
+// silent first-run adoption can never swallow an arrival that lands between this prompt and the first tool call.
+if (!sess.legacy) {
+  const ef = join(root, myHandle, "events.jsonl");
+  let m = 0; try { m = statSync(ef).mtimeMs; } catch {}
+  if (!sess.session.btw || m > (sess.session.btw.mtime || 0)) {
+    sess.session = { ...sess.session, btw: cursorAtEnd(ef) };
+    writeSession(root, myHandle, runtime, sessionId, sess.session);
+  }
+}
+
 // ================= 2. WAITING REPORT =================
+// ---- ledger witness (lib/ledger-head.mjs, docs/VERIFY.md) ----
+// At most every 10 minutes: fetch the signed head and verify it extends the head this machine stored last. A fork
+// (or a changed signing key) is recorded locally and rides on EVERY prompt's banner until a human runs
+// `agent-channel ledger ack`; nothing the server says can clear it.
+try {
+  const lr = await maybeCheckLedger({ server: url, headers: H, dir: root });
+  if (lr && lr.status === "unavailable") diag(root, runtime, "ledger.check", lr.why);
+} catch (e) { diag(root, runtime, "ledger.check", e); }
+let ledgerAlertList = [];
+try { ledgerAlertList = ledgerAlerts(root, url).map(alertLine); } catch (e) { diag(root, runtime, "ledger.alerts", e); }
+
 // A peek can come from three places, in descending order of trust: fetched live this run, the listener's
 // peek.json, or the runtime's short-lived cache. Only the first is server truth. Items are marked read by
 // things this hook never sees - my_inbox over MCP, another session, the human on their phone - and none of
@@ -180,9 +254,9 @@ const fetchPeek = async () => {
     // 2026-08-27: every peek.json write carries the writing runtime. /peek is runtime-scoped now, so the
     // file's content is one runtime's view; a sibling hook reading an unstamped fresh file computed n=0
     // and silently skipped a handoff meant for it. Readers distrust any stamp that is not their own.
-    try { writeFileSync(cacheFile, JSON.stringify({ at: Date.now(), runtime, peek: fresh })); } catch (e) { diag(root, runtime, "cache.write", e); }
+    try { writeFileSync(cacheFile, JSON.stringify({ at: Date.now(), runtime, peek: fresh }), { mode: 0o600 }); } catch (e) { diag(root, runtime, "cache.write", e); }
     // keep the listener's copy in step, so a file it wrote before the read does not re-raise next prompt
-    if (fresh?.handle) { try { writeFileSync(join(root, fresh.handle, "peek.json"), JSON.stringify({ at: Date.now(), runtime, peek: fresh })); } catch (e) { diag(root, runtime, "peekfile.write", e); } }
+    if (fresh?.handle) { try { writeFileSync(join(root, fresh.handle, "peek.json"), JSON.stringify({ at: Date.now(), runtime, peek: fresh }), { mode: 0o600 }); } catch (e) { diag(root, runtime, "peekfile.write", e); } }
     return fresh;
   } catch (e) { diag(root, runtime, "peek.fetch", e); return null; }
 };
@@ -229,14 +303,23 @@ if (!verified && renderable(peek)) {
 if (peekDenied) {
   peek = emptyPeek(myHandle || peek?.handle);
   verified = true;
-  try { writeFileSync(cacheFile, JSON.stringify({ at: Date.now(), runtime, peek })); } catch (e) { diag(root, runtime, "cache.write", e); }
+  try { writeFileSync(cacheFile, JSON.stringify({ at: Date.now(), runtime, peek }), { mode: 0o600 }); } catch (e) { diag(root, runtime, "cache.write", e); }
   // The listener's shared per-person file can hold the same stale unread row, and the listener (its own
   // process, possibly its own token) may keep it fresh enough to pass the 120s trust window above -- so
   // clearing only the runtime cache leaves a second resurrection path. Stamp it empty with OUR runtime;
   // a healthy listener's next write simply replaces it.
-  if (peek.handle) { try { writeFileSync(join(root, peek.handle, "peek.json"), JSON.stringify({ at: Date.now(), runtime, peek })); } catch (e) { diag(root, runtime, "peekfile.write", e); } }
+  if (peek.handle) { try { writeFileSync(join(root, peek.handle, "peek.json"), JSON.stringify({ at: Date.now(), runtime, peek }), { mode: 0o600 }); } catch (e) { diag(root, runtime, "peekfile.write", e); } }
 }
 if (peek?.handle && !myHandle) myHandle = peek.handle;
+// Split what is waiting between this session and the others. Everything from here on works on `peek` = this
+// session's share, exactly as it used to work on the whole; `peekAll` is kept for the places that must see every
+// live item (pruning seen-stamps, rewriting the shared peek.json).
+const peekAll = peek;
+const isMine = sess.legacy ? () => true : (key) => routeFor(sess.claims, key) === sessionId;
+let elsewhere = 0;
+if (!sess.legacy && peek) ({ mine: peek, elsewhere } = routePeek(peekAll, isMine, myHandle));
+const allLiveIds = new Set((peekAll?.items || []).map((i) => i.id));
+const allLiveLines = new Set(peekAll?.summary || []);
 
 // files the listener has already fetched and inspected, not yet shown
 const newFiles = [];
@@ -245,15 +328,32 @@ if (myHandle) {
     const seenF = join(root, myHandle, "artifacts.seen");
     const seen = new Set(existsSync(seenF) ? readFileSync(seenF, "utf8").split("\n").filter(Boolean) : []);
     const lines = readFileSync(join(root, myHandle, "artifacts.jsonl"), "utf8").split("\n").filter(Boolean);
-    for (const l of lines) { try { const r = JSON.parse(l); if (!seen.has(r.id)) newFiles.push(r); } catch {} }
+    for (const l of lines) {
+      try {
+        const r = JSON.parse(l);
+        if (seen.has(r.id)) continue;
+        // a file belongs to its sender's thread; one routed elsewhere stays unseen for the session it goes to
+        if (isMine(threadOfItem({ from: r.from }, myHandle))) newFiles.push(r); else elsewhere++;
+      } catch {}
+    }
     if (newFiles.length) appendFileSync(seenF, newFiles.map((r) => r.id).join("\n") + "\n");
   } catch (e) { if (e?.code !== "ENOENT") diag(root, runtime, "artifacts.read", e); }
 }
 
 // Claude Code: register the listener's notify file so FileChanged fires while idle (no model turn).
 const watchPaths = (runtime === "claude" && eventName === "SessionStart" && myHandle) ? [join(root, myHandle, "agentchan_notify")] : null;
-const finish = (obj) => { if (watchPaths) { obj = obj || {}; obj.hookSpecificOutput = { hookEventName: "SessionStart", ...(obj.hookSpecificOutput || {}), watchPaths }; } if (obj) out(obj); process.exit(0); };
-if (!peek && !newFiles.length) finish(null);
+// Stale client copy (lib/client-version.mjs): SessionStart only, so it is said once per session and never per prompt.
+// The server's client_latest rides on the peek this run already has; no field (older server) -> nothing.
+let staleNotice = null;
+if (eventName === "SessionStart") { try { staleNotice = staleClientNotice(versionAt(REPO), peekAll?.client_latest); } catch (e) { diag(root, runtime, "client.version", e); } }
+const finish = (obj) => { if (staleNotice) {
+    obj = obj || {};
+    obj.systemMessage = obj.systemMessage ? staleNotice.human + "\n" + obj.systemMessage : staleNotice.human;
+    const ctx = obj.hookSpecificOutput?.additionalContext;
+    obj.hookSpecificOutput = { ...(obj.hookSpecificOutput || {}), hookEventName: "SessionStart", additionalContext: ctx ? ctx + "\n" + staleNotice.agent : "[Agent Channel] " + staleNotice.agent };
+  }
+  if (watchPaths) { obj = obj || {}; obj.hookSpecificOutput = { hookEventName: "SessionStart", ...(obj.hookSpecificOutput || {}), watchPaths }; } if (obj) out(obj); process.exit(0); };
+if (!peek && !newFiles.length && !ledgerAlertList.length) finish(null);
 // Delayed-ack ids parked by the PREVIOUS prompt (codex acks one prompt late: the model prints the banner
 // during the turn AFTER the hook). 2026-08-27 round 3 (Codex CLI finding, ~12-14k tokens measured): this
 // used to run after the banner was assembled, so a listener refresh from the still-unread server row
@@ -271,7 +371,7 @@ if (parked.length) {
     // a parked ack can be the run's FIRST 401 (peek answered from a fresh local file, no fetch yet):
     // give the file token the same one chance here, or the park file retries a dead credential forever
     if ((r.status === 401 || r.status === 403) && (await healToken())) r = await fetch(url + "/ack", { method: "POST", headers: H, body: JSON.stringify({ ids: parked }), signal: AbortSignal.timeout(4000) });
-    if (r.ok) { writeFileSync(pendingAckFile, "[]"); parkedRemaining = []; }
+    if (r.ok) { writeFileSync(pendingAckFile, "[]", { mode: 0o600 }); parkedRemaining = []; }
     else diag(root, runtime, "ack.post.status", "HTTP " + r.status);
   } catch (e) { diag(root, runtime, "ack.post", e); }
 }
@@ -300,7 +400,11 @@ for (const id of parked) if (idMap[id] !== undefined) ip.next[id] = idMap[id];
 // stale file made an already-shown handoff look like a first sighting and the full body re-rendered -- the
 // 2026-08-28 loop. On anything but a parsed 200, carry every existing stamp forward.
 if (!serverTruth) for (const [id, ts] of Object.entries(idMap)) if (ip.next[id] === undefined) ip.next[id] = ts;
-try { writeFileSync(idsFile, JSON.stringify(ip.next)); } catch (e) { diag(root, runtime, "seen.ids.write", e); }
+// Session routing: this run only looked at ITS share of the items, so "absent from my keys" no longer means
+// resolved. An item still live on the server but routed to another session keeps its stamp; otherwise a stamp
+// set when it was shown there would be pruned here and the next render would treat it as a first sighting.
+if (!sess.legacy) for (const [id, ts] of Object.entries(idMap)) if (ip.next[id] === undefined && allLiveIds.has(id)) ip.next[id] = ts;
+try { writeFileSync(idsFile, JSON.stringify(ip.next), { mode: 0o600 }); } catch (e) { diag(root, runtime, "seen.ids.write", e); }
 const firstTime = new Set(ip.fresh);
 const humans = humansAll.filter((i) => firstTime.has(i.id));
 const hands = handsAll.filter((i) => firstTime.has(i.id));
@@ -316,9 +420,11 @@ const repeats = [...humansAll, ...handsAll].filter((i) => !firstTime.has(i.id));
 // The age is deliberately NOT in this text: the marker is keyed on the line, so a line that changes every
 // prompt would never be recognised as already-shown and would re-nag forever - the exact bug this file exists
 // to fix. The age and the expiry countdown are in my_inbox, which is where the line points.
-const staleHandoffs = (peek?.handoffs_for_other_runtimes || [])
+const staleLines = (p) => (p?.handoffs_for_other_runtimes || [])
   .filter((h) => h.status === "stale")
   .map((h) => "handoff for " + (h.for_runtime || "another runtime") + " has not been taken up, though that runtime has been online since; my_inbox has it (and how long)");
+const staleHandoffs = staleLines(peek);
+for (const l of staleLines(peekAll)) allLiveLines.add(l);
 const others = [...staleHandoffs, ...(peek?.summary || [])].filter((s) => !humansAll.some((h) => s.startsWith(h.from + ":") || s.startsWith(h.from + " (")) && !(s.startsWith("HANDOFF") && s.includes("(THIS session)")));
 // Summary lines have no ack path (nothing sets read_at on a pending proposal), so before 2026-08-27 each one
 // re-fired this banner verbatim on every prompt until resolved. Local seen-markers: full text the first time,
@@ -331,7 +437,8 @@ const OTHERS_SHOWN = 6;
 const sp = splitSurfaced(surfacedMap, others, Date.now(), 6 * 3600 * 1000, OTHERS_SHOWN);
 // same rule as the message-id stamps above: only a parsed 200 may prune
 if (!serverTruth) for (const [k, ts] of Object.entries(surfacedMap)) if (sp.next[k] === undefined) sp.next[k] = ts;
-try { writeFileSync(surfacedFile, JSON.stringify(sp.next)); } catch (e) { diag(root, runtime, "seen.summary.write", e); }
+if (!sess.legacy) for (const [k, ts] of Object.entries(surfacedMap)) if (sp.next[k] === undefined && allLiveLines.has(k)) sp.next[k] = ts;
+try { writeFileSync(surfacedFile, JSON.stringify(sp.next), { mode: 0o600 }); } catch (e) { diag(root, runtime, "seen.summary.write", e); }
 const othersFresh = sp.fresh;
 const othersMutedLine = sp.muted.length ? sp.muted.length + " more item" + (sp.muted.length > 1 ? "s" : "") + " still waiting (shown earlier; my_inbox lists them)" : null;
 // delivery receipts: human messages I sent that were read since the last time this hook reported them
@@ -343,7 +450,7 @@ if (myHandle && Array.isArray(peek?.sent)) {
   if (fresh.length) {
     const byTo = new Map(); for (const m of fresh) { if (!byTo.has(m.to)) byTo.set(m.to, []); byTo.get(m.to).push(m); }
     for (const [to, list] of byTo) receipts.push(to + " read " + (list.length === 1 ? "your message: " + JSON.stringify((list[0].preview || "").slice(0, 50)) : list.length + " of your messages"));
-    try { writeFileSync(rf, JSON.stringify([...reported.slice(-200), ...fresh.map((m) => m.id)])); } catch (e) { diag(root, runtime, "receipts.write", e); }
+    try { writeFileSync(rf, JSON.stringify([...reported.slice(-200), ...fresh.map((m) => m.id)]), { mode: 0o600 }); } catch (e) { diag(root, runtime, "receipts.write", e); }
   }
 }
 // parked rows are hidden above but the server still counts them unread until the /ack lands
@@ -352,13 +459,26 @@ const n = Math.max(0, (peek?.unread_messages || 0) - parkedInPeek) + (peek?.prop
 // original bug - but it must not be silenced by n being zero either, or the one case this signal exists for
 // (nothing else waiting, a handoff quietly rotting toward its 3-day delete) is the one case never reported.
 const staleShown = othersFresh.some((l) => staleHandoffs.includes(l));
-if (n === 0 && !receipts.length && !staleShown) finish(null);
+if (n === 0 && !receipts.length && !staleShown && !ledgerAlertList.length) {
+  // Nothing routed to this session. The most it may say is the count of what waits in the others, one line,
+  // and only when that count changed since this session last saw it. No bodies, no acks, nothing else.
+  if (!sess.legacy) {
+    const last = sess.session.last_count;
+    if (elsewhere !== last) writeSession(root, myHandle, runtime, sessionId, { ...sess.session, last_count: elsewhere });
+    if (shouldShowCount(last, elsewhere)) {
+      const line = countLine(elsewhere);
+      finish(runtime === "claude" ? { systemMessage: line } : { systemMessage: line, hookSpecificOutput: { hookEventName: eventName || "UserPromptSubmit", additionalContext: line } });
+    }
+  }
+  finish(null);
+}
+if (!sess.legacy && elsewhere !== sess.session.last_count) writeSession(root, myHandle, runtime, sessionId, { ...sess.session, last_count: elsewhere });
 
 // Rendering lives in lib/banner.mjs: pure, and therefore reachable by a test without spawning this script.
 // What stays here is what has side effects - acquisition, the trust decision, seen-marking, acking.
 const { human, agent, sys, codexBlock } = buildBanner({
   runtime, myHandle, n, humans, hands, repeats, newFiles,
-  othersFresh, othersMutedLine, mutedCount: sp.muted.length, receipts,
+  othersFresh, othersMutedLine, mutedCount: sp.muted.length, receipts, ledgerAlerts: ledgerAlertList,
 });
 if (!n && receipts.length) { if (runtime === "claude") finish({ systemMessage: sys }); }
 
@@ -370,12 +490,14 @@ if (!n && receipts.length) { if (runtime === "claude") finish({ systemMessage: s
 if (humans.length || hands.length || repeats.length) {
   const shown = [...humans, ...hands, ...repeats].map((h) => h.id);
   if (runtime === "claude" || !pendingAckFile) { try { const ar = await fetch(url + "/ack", { method: "POST", headers: H, body: JSON.stringify({ ids: shown }), signal: AbortSignal.timeout(4000) }); if (!ar.ok) diag(root, runtime, "ack.post.status", "HTTP " + ar.status); } catch (e) { diag(root, runtime, "ack.post", e); } }
-  else { try { writeFileSync(pendingAckFile, JSON.stringify([...new Set([...parkedRemaining, ...shown])])); } catch (e) { diag(root, runtime, "ack.park.write", e); } }
+  else { try { writeFileSync(pendingAckFile, JSON.stringify([...new Set([...parkedRemaining, ...shown])]), { mode: 0o600 }); } catch (e) { diag(root, runtime, "ack.park.write", e); } }
   // and rewrite the local peek without them so the next prompt does not repeat them before the listener refreshes
   if (myHandle) {
     try {
-      const filtered = { ...peek, items: items.filter((i) => i.type !== "human" && !(i.type === "handoff" && i.for_this_runtime)), unread_messages: Math.max(0, (peek.unread_messages || 0) - parkedInPeek - humansAll.length - handsAll.length), summary: others };
-      writeFileSync(join(root, myHandle, "peek.json"), JSON.stringify({ at: Date.now(), runtime, peek: filtered }));
+      // From the WHOLE peek, not this session's share: the file is shared by every session of the runtime, and
+      // writing only our share would hide the other sessions' items from them until the listener next refreshed.
+      const filtered = removeFromPeek(peekAll, [...shown, ...parked]);
+      writeFileSync(join(root, myHandle, "peek.json"), JSON.stringify({ at: Date.now(), runtime, peek: filtered }), { mode: 0o600 });
     } catch {}
   }
 }

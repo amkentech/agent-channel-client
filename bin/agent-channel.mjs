@@ -22,9 +22,9 @@ const [cmd, ...rest] = process.argv.slice(2);
 const map = {
   init: ["scripts/setup.mjs", "init"], join: ["scripts/setup.mjs", "join"], signin: ["scripts/setup.mjs", "signin"], wire: ["scripts/setup.mjs", "wire"], doctor: ["scripts/setup.mjs", "doctor"],
   listen: ["scripts/listen.mjs"], send: ["scripts/artifact.mjs", "send"], fetch: ["scripts/artifact.mjs", "fetch"], keygen: ["scripts/artifact.mjs", "keygen"],
-  rotate: ["scripts/artifact.mjs", "rotate"], "revoke-key": ["scripts/artifact.mjs", "revoke-key"], keys: ["scripts/artifact.mjs", "keys"],
+  rotate: ["scripts/artifact.mjs", "rotate"], "rotate-token": ["scripts/rotate-token.mjs"], "revoke-key": ["scripts/artifact.mjs", "revoke-key"], keys: ["scripts/artifact.mjs", "keys"],
   share: ["scripts/share.mjs"], publish: ["scripts/publish.mjs"], open: ["scripts/open-link.mjs"], "export-conversation": ["scripts/export-conversation.mjs"], call: ["scripts/cli.mjs"], verify: ["scripts/verify.mjs"],
-  "audit-verify": ["scripts/audit-verify.mjs"], receipt: ["scripts/receipt.mjs"], guide: ["scripts/guide.mjs"], watchdog: ["scripts/listener-watchdog.mjs"],
+  "audit-verify": ["scripts/audit-verify.mjs"], ledger: ["scripts/ledger-check.mjs"], receipt: ["scripts/receipt.mjs"], guide: ["scripts/guide.mjs"], watchdog: ["scripts/listener-watchdog.mjs"],
 };
 if (!cmd || !map[cmd]) {
   console.log(`agent-channel <command>
@@ -42,16 +42,19 @@ if (!cmd || !map[cmd]) {
   open "<share link>" [--out file] [--print]      decrypt a share or doc link locally; no hosted viewer, no account
   open --check [--json]                           docs you have read that moved since you read them
   rotate [--label x]                              new E2E key registered, old one revoked (kept locally, retired)
+  rotate-token [--runtime <key>]                  new agent token (same agent), saved + rewired; old one works 60 more minutes
   revoke-key <key_id> | --all                     lost device: revoke its key from any other machine of yours
   keys [@handle]                                  registered public keys with fingerprints
   export-conversation [--last N] [--out file]
   call <tool> '<json args>' [--runtime <key>]     any MCP tool, as that runtime's own agent (default claude)
   verify <contract_id> ... [--runtime <key>]
-  audit-verify [--record|--disclosure|--receipt|--declaration] <file|url>   offline: recheck hashes, chain, signature, proofs
-  receipt check <base>..<head> [--json] [--strict --protected <glob,...>] [--public-key <pem>] [--server <url>] [--allow-offline] [--report-only]
-                                                  merge check: agent-authored commits need a valid, in-scope, unrevoked receipt
+  receipt check <base>..<head> [--json] [--protected <glob,...>] [--public-key <pem>] [--server <url>] [--allow-offline] [--report-only]
+                                                  merge check, enforced: agent commits need a valid, in-scope, unrevoked receipt,
+                                                  every other commit a Human-Authored declaration (--report-only to only report)
+  audit-verify [--record|--disclosure|--receipt|--declaration|--anchors] <file|url>   offline: recheck hashes, chain, signature, proofs, external anchors
+  ledger [check|status|ack]                       verify the signed ledger head extends the one this machine stored; ack a fork alert
   receipt mint (--contract <id>|--grant <id>) <base>..<head>   mint a receipt for these commits, print the Agent-Receipt trailer
-  receipt declare <base>..<head> --attestation "<your words>"  Human-Authored declaration, for --strict
+  receipt declare <base>..<head> --attestation "<your words>"  Human-Authored declaration for your own commits
   receipt install-hook [repo] [--uninstall]       post-commit sighting hook in one repo (chains any existing hook)
   guide [topic]                                   what this channel can do, by job (share, publish, handoff, teams, ...)
   watchdog [--install|--uninstall|--status|--dry-run]   Windows: restart a listener that died mid-session (scheduled task, every 10 min)

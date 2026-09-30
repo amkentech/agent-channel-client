@@ -18,7 +18,7 @@ import { readFileSync, statSync, writeFileSync, mkdirSync, existsSync, readdirSy
 import { basename, join, resolve, dirname } from "node:path";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
-import { encryptFor, ensureKey, sha256hex, generateKeypair, findLocalKey, saveLocalKey, decryptWith, loadLocalKeys } from "../lib/crypto.mjs";
+import { encryptFor, ensureKey, sha256hex, generateKeypair, generateSigningKeypair, findLocalKey, saveLocalKey, decryptWith, loadLocalKeys, recipientsFor, fp, pinFile, readPins, savePins, signEnvelope, signingKey } from "../lib/crypto.mjs";
 import { fetchArtifact } from "../lib/artifacts.mjs";
 
 const args = process.argv.slice(2);
@@ -55,21 +55,13 @@ async function myHandle() {
 }
 
 const cmd = args[0];
-// ---- key pins: ~/.agentchan/pins/<handle>.json  [{id, public_key, label, runtime, first_seen}] ----
-const pinDir = join(homedir(), ".agentchan", "pins");
-const pinFile = (h) => join(pinDir, String(h).replace(/^@/, "").toLowerCase() + ".json");
-const fp = (pub) => createHash("sha256").update(String(pub)).digest("hex").match(/.{4}/g).slice(0, 8).join(" ");
+// ---- key pins: ~/.agentchan/pins/<handle>.json (lib/crypto.mjs: readPins / savePins, created 0700/0600) ----
 function checkPins(to, keys) {
-  let pinned = []; try { pinned = JSON.parse(readFileSync(pinFile(to), "utf8")); } catch {}
+  const pinned = readPins(to);
   const fresh = keys.filter((k) => !pinned.some((p) => p.id === k.id || p.public_key === k.public_key));
   return { pinned, fresh };
 }
-function savePins(to, keys) {
-  let cur = []; try { cur = JSON.parse(readFileSync(pinFile(to), "utf8")); } catch {}
-  const now = new Date().toISOString();
-  for (const k of keys) if (!cur.some((p) => p.id === k.id || p.public_key === k.public_key)) cur.push({ id: k.id, public_key: k.public_key, label: k.label, runtime: k.runtime, fingerprint: fp(k.public_key), first_seen: now });
-  mkdirSync(pinDir, { recursive: true }); writeFileSync(pinFile(to), JSON.stringify(cur, null, 2));
-}
+const keyLine = (k) => "  " + fp(k.public_key) + "  " + (k.label || "") + " (" + (k.runtime || "?") + ")" + (k.sign_public_key ? "  signing " + fp(k.sign_public_key) : "");
 
 try {
   if (cmd === "send") {
@@ -79,33 +71,51 @@ try {
     const st = statSync(abs);
     if (st.size > 8 * 1024 * 1024) throw new Error("file is " + st.size + " bytes; 8 MB max");
     const bytes = readFileSync(abs);
-    const { keys } = await api("/keys/" + to.replace(/^@/, ""));
-    if (!keys.length) throw new Error(to + " has no registered keys yet (their listener registers one on first connect). Ask them to run: node scripts/artifact.mjs keygen");
+    const keysResp = await api("/keys/" + to.replace(/^@/, ""));
+    const { keys } = keysResp;
+    if (!keys.filter((k) => !(keysResp.encryption?.required_key_ids || []).includes(k.id)).length) throw new Error(to + " has no registered keys yet (their listener registers one on first connect). Ask them to run: node scripts/artifact.mjs keygen");
     // Key pinning (trust on first use). The server hands out the recipient's public keys; a malicious operator could add one
     // and read everything encrypted from then on. So remember the keys we have seen per handle, and refuse to encrypt to a
     // NEW key until the human says so (--trust-new-keys), after comparing fingerprints with the other person out of band.
     const { pinned, fresh } = checkPins(to, keys);
-    if (fresh.length && pinned.length && !has("--trust-new-keys")) {
-      console.error("REFUSED: " + to + " has " + fresh.length + " key(s) you have never encrypted to before:\n" + fresh.map((k) => "  " + fp(k.public_key) + "  " + (k.label || "") + " (" + (k.runtime || "?") + ")").join("\n") +
+    // --only-pinned is read BEFORE the refusal it is offered in: encrypting to the already-pinned keys only is the
+    // way past a new key without trusting it (it used to be named here and then never reached).
+    const onlyPinned = has("--only-pinned") && pinned.length > 0;
+    if (fresh.length && pinned.length && !has("--trust-new-keys") && !onlyPinned) {
+      console.error("REFUSED: " + to + " has " + fresh.length + " key(s) you have never encrypted to before:\n" + fresh.map(keyLine).join("\n") +
         "\nAsk " + to + " to confirm these fingerprints (they run: node scripts/artifact.mjs keys), then re-run with --trust-new-keys. Or --only-pinned to encrypt to the known keys only.");
       process.exit(3);
     }
-    const useKeys = has("--only-pinned") && pinned.length ? keys.filter((k) => pinned.some((p) => p.id === k.id)) : keys;
+    // The server's declared encryption mode (docs/BANK.md step 7): escrow / at_rest keys are always included.
+    const { mode: encMode, recipients: useKeys, required } = recipientsFor(keysResp, { pinned, onlyPinned });
+    if (required.length) console.error("this deployment's encryption mode is " + encMode + ": the file is also encrypted to " + required.map((k) => k.id + " (" + fp(k.public_key) + ")").join(", "));
     if (!pinned.length) {
-      console.error("first send to " + to + ": " + keys.length + " key(s) the server reports for them:\n" + keys.map((k) => "  " + fp(k.public_key) + "  " + (k.label || "") + " (" + (k.runtime || "?") + ")").join("\n") + "\nThese get pinned; later changes are refused until you pass --trust-new-keys. If this file matters, confirm the fingerprints with " + to + " out of band (they run: node scripts/artifact.mjs keys).");
-      if (process.stdin.isTTY && !has("--trust-new-keys") && !has("--yes")) {
-        const { createInterface } = await import("node:readline/promises");
-        const rl = createInterface({ input: process.stdin, output: process.stderr });
-        const ans = (await rl.question("Encrypt to these keys and pin them? [y/N] ")).trim().toLowerCase(); rl.close();
-        if (ans !== "y" && ans !== "yes") { console.error("not sent."); process.exit(3); }
+      console.error("first send to " + to + ": " + keys.length + " key(s) the server reports for them:\n" + keys.map(keyLine).join("\n") + "\nThese get pinned; later changes are refused until you pass --trust-new-keys. Confirm the fingerprints with " + to + " out of band (they run: node scripts/artifact.mjs keys).");
+      if (!has("--trust-new-keys")) {
+        // Trust on first use is only as good as the look it gets. With no terminal (a hook, a script, an agent) there
+        // is no one to look, so first contact needs the explicit flag rather than pinning whatever the server said.
+        if (!process.stdin.isTTY) { console.error("REFUSED: first send to " + to + " with no terminal to confirm the fingerprints above. Check them with " + to + ", then run: node scripts/artifact.mjs send " + to + " <path> --trust-new-keys"); process.exit(3); }
+        if (!has("--yes")) {
+          const { createInterface } = await import("node:readline/promises");
+          const rl = createInterface({ input: process.stdin, output: process.stderr });
+          const ans = (await rl.question("Encrypt to these keys and pin them? [y/N] ")).trim().toLowerCase(); rl.close();
+          if (ans !== "y" && ans !== "yes") { console.error("not sent."); process.exit(3); }
+        }
       }
     }
-    else if (fresh.length) console.error("trusting " + fresh.length + " new key(s) for " + to + " as instructed: " + fresh.map((k) => fp(k.public_key)).join(", "));
+    else if (fresh.length && !onlyPinned) console.error("trusting " + fresh.length + " new key(s) for " + to + " as instructed: " + fresh.map((k) => fp(k.public_key)).join(", "));
     savePins(to, useKeys);
-    const { envelope, ciphertext } = encryptFor(useKeys, bytes);
+    const enc = encryptFor(useKeys, bytes);
+    // Sign as this agent, so the recipient can tell the file came from us and not from the server (lib/crypto.mjs).
+    let envelope = enc.envelope, signedBy = null;
+    try {
+      const signer = await signingKey({ base: BASE, token, inventory: await api("/keys") });
+      if (signer) { envelope = signEnvelope(envelope, enc.ciphertext, basename(abs), signer); signedBy = fp(signer.sign_public_key); }
+    } catch (e) { console.error("note: could not sign (" + e.message + "); sending unsigned"); }
+    if (!signedBy) console.error("note: no signing key registered for this agent yet (the listener adds one on connect, or: artifact.mjs keygen); sending unsigned");
     const contractId = flag("--contract");
-    const r = await api("/artifacts", { method: "POST", body: JSON.stringify({ to, filename: basename(abs), size_bytes: st.size, sha256: sha256hex(bytes), note: flag("--note"), envelope, ciphertext, proposal_id: contractId || undefined }) });
-    console.log("sent " + basename(abs) + " (" + st.size + " bytes) to " + r.to + ", encrypted to " + keys.length + " key(s), artifact " + r.artifact_id + (r.proposal_id ? ", bound to contract " + r.proposal_id : ", expires " + r.expires_at));
+    const r = await api("/artifacts", { method: "POST", body: JSON.stringify({ to, filename: basename(abs), size_bytes: st.size, sha256: sha256hex(bytes), note: flag("--note"), envelope, ciphertext: enc.ciphertext, proposal_id: contractId || undefined }) });
+    console.log("sent " + basename(abs) + " (" + st.size + " bytes) to " + r.to + ", encrypted to " + useKeys.length + " key(s)" + (signedBy ? ", signed " + signedBy : ", unsigned") + ", artifact " + r.artifact_id + (r.proposal_id ? ", bound to contract " + r.proposal_id : ", expires " + r.expires_at));
   } else if (cmd === "fetch") {
     const me = await myHandle();
     if (has("--all") || !args[1]) {
@@ -146,6 +156,19 @@ try {
     writeFileSync(join(dir, "report.json"), JSON.stringify({ ...report, from: a.from, to: a.to, fetched_by: "@" + me.handle, org_escrow: true }, null, 2));
     console.log("decrypted " + a.filename + " (" + a.from + " -> " + a.to + ") to " + out + "  [" + report.verdict + "]");
     console.log("the member was notified of this fetch, and it is on the audit ledger.");
+  } else if (cmd === "org-records") {
+    // escrow mode (docs/BANK.md step 7): message / proposal copies the server encrypted to the org escrow key
+    const r = await api("/org/records");
+    if (!r.records.length) console.log("no escrow records among " + r.org + " members");
+    for (const x of r.records) console.log(x.id + "  " + x.kind + "  @" + x.from_handle + " -> @" + x.to_handle + "  " + x.created_at + (x.tombstoned_at ? "  [tombstoned]" : ""));
+  } else if (cmd === "org-record") {
+    const me = await myHandle();
+    if (!args[1]) { console.error("usage: artifact.mjs org-record <record_id>"); process.exit(1); }
+    const a = await api("/org/records/" + args[1]);
+    if (a.tombstoned) { console.log("tombstoned by retention; content sha256 " + a.content_sha256); process.exit(0); }
+    const plain = decryptWith(loadLocalKeys(me.handle), a.envelope, a.ciphertext);
+    console.log(a.kind + " " + a.from + " -> " + a.to + " at " + a.created_at + " (sha256 " + a.content_sha256 + (sha256hex(plain) === a.content_sha256 ? ", verified" : ", MISMATCH") + ")\n" + plain.toString("utf8"));
+    console.log("\nboth members were notified of this read, and it is on the audit ledger.");
   } else if (cmd === "keygen") {
     const me = await myHandle();
     const label = flag("--label") || (me.agent + "-" + me.runtime + "-" + (process.env.COMPUTERNAME || process.env.HOSTNAME || "host")).toLowerCase();
@@ -158,8 +181,8 @@ try {
     const me = await myHandle();
     const label = flag("--label") || (me.agent + "-" + me.runtime + "-" + (process.env.COMPUTERNAME || process.env.HOSTNAME || "host")).toLowerCase();
     const old = findLocalKey(me.handle, label);
-    const kp = generateKeypair();
-    const r = await api("/keys", { method: "POST", body: JSON.stringify({ public_key: kp.public_key, label }) });
+    const kp = { ...generateKeypair(), ...generateSigningKeypair() };
+    const r = await api("/keys", { method: "POST", body: JSON.stringify({ public_key: kp.public_key, sign_public_key: kp.sign_public_key, label }) });
     if (old) saveLocalKey(me.handle, label + "-retired-" + new Date().toISOString().slice(0, 10), old);
     saveLocalKey(me.handle, label, { ...kp, key_id: r.key_id });
     let revoked = null;
@@ -188,7 +211,7 @@ try {
   } else if (cmd === "keys") {
     const who = args[1] ? args[1].replace(/^@/, "") : (await myHandle()).handle;
     const r = await api("/keys/" + who);
-    console.log(JSON.stringify({ ...r, keys: r.keys.map((k) => ({ fingerprint: fp(k.public_key), ...k })) }, null, 2));
+    console.log(JSON.stringify({ ...r, keys: r.keys.map((k) => ({ fingerprint: fp(k.public_key), ...(k.sign_public_key ? { signing_fingerprint: fp(k.sign_public_key) } : {}), ...k })) }, null, 2));
   } else {
     console.log("usage: artifact.mjs send @handle <path> [--note text] [--trust-new-keys|--only-pinned] | fetch <id>|--all | keygen [--label x] | rotate [--label x] | revoke-key <key_id>|--all | keys [@handle] | pins [@handle]");
     process.exit(cmd ? 1 : 0);

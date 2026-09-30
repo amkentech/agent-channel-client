@@ -63,7 +63,7 @@ const TOAST = !process.argv.includes("--no-toast") && ["win32", "darwin", "linux
 
 let handle = "unknown";
 let dir = null;
-const ensureDir = () => { dir = join(homedir(), ".agentchan", handle); mkdirSync(dir, { recursive: true }); return dir; };
+const ensureDir = () => { dir = join(homedir(), ".agentchan", handle); mkdirSync(dir, { recursive: true, mode: 0o700 }); return dir; };
 
 const headers = { authorization: "Bearer " + token };
 async function refreshPeek() {

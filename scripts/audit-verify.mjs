@@ -5,6 +5,8 @@
 //   node scripts/audit-verify.mjs --disclosure disclosure.json        disclose_contract / GET /c/:id/disclosure.json (any subset of facts)
 //   node scripts/audit-verify.mjs --receipt <file|url>               GET /receipts/<id>.json (signature, digest, every fact's proof)
 //   node scripts/audit-verify.mjs --declaration <file|url>           GET /declarations/<id>.json (signature, digest)
+//   node scripts/audit-verify.mjs --anchors <file|url> [--tsa-root pem] [--rekor-key pem] [--export export.json]
+//                                                                    GET /ledger/anchors: RFC 3161 tokens + Rekor entries, offline
 //   options: --pubkey|--public-key <pem file> | --pubkey-url <url> (default: the server named in the export), --no-sig (skip signature)
 // Checks: every ledger row's hash from its canonical string, every visible chain link, and (if present) the server's Ed25519
 // signature over the sha256 of the canonical JSON body, against a public key you supply or fetch. Pin the key out of band
@@ -14,8 +16,78 @@ import { createHash, createPublicKey, verify as edVerify } from "node:crypto";
 
 const args = process.argv.slice(2);
 const opt = (k) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
-const file = args.find((a, i) => !a.startsWith("--") && !["--pubkey", "--pubkey-url", "--public-key", "--server"].includes(args[i - 1]));
-if (!file) { console.error("usage: audit-verify.mjs [--record|--disclosure|--receipt|--declaration] <file.json|url> [--pubkey file.pem | --public-key file.pem | --pubkey-url url | --no-sig]"); process.exit(1); }
+const file = args.find((a, i) => !a.startsWith("--") && !["--pubkey", "--pubkey-url", "--public-key", "--server", "--tsa-root", "--rekor-key", "--export"].includes(args[i - 1]));
+if (!file) { console.error("usage: audit-verify.mjs [--record|--disclosure|--receipt|--declaration|--anchors] <file.json|url> [--pubkey file.pem | --public-key file.pem | --pubkey-url url | --no-sig]\n       audit-verify.mjs --anchors <anchors.json|https://server/ledger/anchors> [--tsa-root root.pem ...] [--rekor-key key.pem ...] [--export audit-export.json]"); process.exit(1); }
+
+// ---- external anchors (GET /ledger/anchors; docs/VERIFY.md "External anchors") ----
+// Offline except for fetching the listing when given a URL. Every RFC 3161 token: messageImprint == the anchored head
+// hash, the TSA's signature over the signed attributes, the signing-certificate attribute, the chain to a PINNED root
+// (lib/anchor-roots/, plus any --tsa-root), all valid at genTime. Every Rekor entry: the logged hash, the RFC 6962
+// inclusion proof to the checkpoint's root, the checkpoint's signature and the signed entry timestamp, against the
+// pinned log key (plus any --rekor-key). With --export, each anchored head is tied to the recomputed ledger row.
+if (args.includes("--anchors")) {
+  const av = await import("../lib/anchor-verify.mjs");
+  const rv = await import("../lib/receipt-verify.mjs");
+  const all = (k) => args.flatMap((a, i) => (a === k && args[i + 1] ? [args[i + 1]] : []));
+  const roots = av.bundledRoots();
+  for (const f of all("--tsa-root")) roots.tsa.push({ name: f, pem: readFileSync(f, "utf8") });
+  for (const f of all("--rekor-key")) roots.rekor.push({ name: f, pem: readFileSync(f, "utf8") });
+  console.log("pinned TSA roots: " + roots.tsa.map((r) => r.name).join("; "));
+  console.log("pinned Rekor keys: " + roots.rekor.map((r) => r.name).join("; "));
+  let anchors = [], listing;
+  try {
+    listing = await rv.loadJson(file);
+    anchors.push(...(listing.anchors || []));
+    // a URL listing pages by after_id; follow it (bounded)
+    for (let p = 0; /^https?:\/\//i.test(file) && listing.next_after_id && p < 100; p++) {
+      const u = new URL(file); u.searchParams.set("after_id", listing.next_after_id);
+      listing = await rv.loadJson(u.toString());
+      anchors.push(...(listing.anchors || []));
+    }
+  } catch (e) { console.error("cannot read " + file + ": " + e.message); process.exit(1); }
+  if (!anchors.length) { console.log("no anchors in this listing"); process.exit(1); }
+  let rowsBySeq = null;
+  if (opt("--export")) {
+    let ex = JSON.parse(readFileSync(opt("--export"), "utf8"));
+    if (ex.content?.[0]?.text) ex = JSON.parse(ex.content[0].text);
+    const b = ex.body || ex;
+    rowsBySeq = new Map((b.entries || b.timeline || []).map((e) => [Number(e.seq), e]));
+  }
+  const canonRow = (e) => e.canonical ?? ((e.prev_hash ?? "") + "|" + String(e.seq) + "|" + e.at_canon + "|" + (e.actor_person ?? "") + "|" + (e.actor_agent ?? "") + "|" + (e.subject_person ?? "") + "|" + e.action + "|" + (e.object_type ?? "") + "|" + (e.object_id ?? "") + "|" + e.payload_text + (e.policy_version ? "|pv:" + e.policy_version : ""));
+  let bad = 0;
+  const good = [];
+  for (const a of anchors.sort((x, y) => Number(x.head_seq) - Number(y.head_seq) || Number(x.id) - Number(y.id))) {
+    const r = av.verifyAnchor({ kind: a.kind, head_hash: a.head_hash, proof: a.proof }, roots);
+    const who = a.kind === "rfc3161" ? (r.tsa || a.proof?.tsa || a.anchor_name) + " (RFC 3161)" : "Rekor " + (a.endpoint || "") + " logIndex " + (r.logIndex ?? a.proof?.entry?.logIndex);
+    const when = a.kind === "rfc3161" ? r.genTime : r.integratedTime;
+    let tie = "";
+    if (rowsBySeq) {
+      const e = rowsBySeq.get(Number(a.head_seq));
+      if (!e) tie = "; seq " + a.head_seq + " not in the export";
+      else {
+        const h = createHash("sha256").update(canonRow(e), "utf8").digest("hex");
+        if (h !== e.hash || e.hash !== a.head_hash) { r.problems.push("export row seq " + a.head_seq + " does not recompute to the anchored hash"); r.ok = false; }
+        else tie = "; export row seq " + a.head_seq + " recomputes to it";
+      }
+    }
+    if (!r.ok) bad++; else good.push({ seq: Number(a.head_seq), who, when });
+    console.log((r.ok ? "anchor ok  " : "ANCHOR FAIL") + "  seq <= " + a.head_seq + "  " + String(a.head_hash).slice(0, 16) + "…  " + a.anchor_name + ": " + who + " at " + (when || "?") + tie);
+    if (r.chain?.length) console.log("    chain: " + r.chain.join(" <- "));
+    for (const p of r.problems || []) console.log("    PROBLEM: " + p);
+  }
+  // Coverage: an anchor on head N countersigns every row up to N (each row's hash is folded into the next).
+  const seqs = [...new Set(good.map((g) => g.seq))].sort((x, y) => x - y);
+  console.log("\ncoverage (a head's anchor covers every row at or before it, as that chain stood at that time):");
+  let lo = 1;
+  for (const s of seqs) {
+    const by = good.filter((g) => g.seq === s).sort((x, y) => String(x.when).localeCompare(String(y.when)));
+    console.log("  rows seq " + lo + ".." + s + ": first anchored " + by[0].when + "; by " + by.map((g) => g.who + " @ " + g.when).join(", "));
+    lo = s + 1;
+  }
+  if (seqs.length) console.log("  rows after seq " + seqs.at(-1) + ": NOT anchored yet (protected only once the next anchor lands)");
+  console.log(bad ? "FAIL: " + bad + " anchor(s) did not verify" : "OK: " + good.length + " anchor(s) verified against outside parties' keys");
+  process.exit(bad ? 2 : 0);
+}
 
 // ---- authorization receipts and Human-Authored declarations (docs/RECEIPTS.md "Wire contract") ----
 // Offline: digest, Ed25519 signature, and (receipts) every fact's salted Merkle proof to the signed root. The key is

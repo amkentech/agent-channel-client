@@ -1,0 +1,27 @@
+{
+  "_note": "Pinned trust roots for external ledger anchors (lib/anchor-verify.mjs, docs/VERIFY.md 'External anchors'). A verifier trusts these keys, never a copy of a root carried inside a token. Check the fingerprints below against the issuer's own publication before relying on them; a bank deployment passes its auditor's TSA root with --tsa-root.",
+  "tsa": [
+    {
+      "name": "DigiCert Trusted Root G4",
+      "file": "digicert-trusted-root-g4.pem",
+      "sha256_fingerprint": "55:2F:7B:DC:F1:A7:AF:9E:6C:E6:72:01:7F:4F:12:AB:F7:72:40:C7:8E:76:1A:C2:03:D1:D9:D2:0A:C8:99:88",
+      "for": "http://timestamp.digicert.com (responder 'DigiCert SHA256 RSA4096 Timestamp Responder 2026 1' via 'DigiCert Trusted G4 TimeStamping RSA4096 SHA256 2025 CA1')",
+      "source": "Mozilla CA root store as shipped in Node.js v22.17.0 (tls.rootCertificates), extracted 2026-09-29; DigiCert publishes the same root at https://cacerts.digicert.com/DigiCertTrustedRootG4.crt"
+    },
+    {
+      "name": "FreeTSA Root CA",
+      "file": "freetsa-root-ca.pem",
+      "sha256_fingerprint": "A6:37:9E:7C:EC:C0:5F:AA:3C:BF:07:60:13:D7:45:E3:27:BB:BA:A3:8C:0B:9A:F2:24:69:D4:70:1D:18:AA:BC",
+      "for": "https://freetsa.org/tsr (responder 'www.freetsa.org', OU=TSA)",
+      "source": "https://freetsa.org/files/cacert.pem, fetched 2026-09-29"
+    }
+  ],
+  "rekor": [
+    {
+      "name": "rekor.sigstore.dev (Sigstore public-good transparency log)",
+      "file": "rekor-sigstore-dev.pem",
+      "log_id": "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d",
+      "source": "https://rekor.sigstore.dev/api/v1/log/publicKey, fetched 2026-09-29; the same key is distributed in the Sigstore TUF root (sigstore/root-signing, trusted_root.json tlogs[].publicKey)"
+    }
+  ]
+}

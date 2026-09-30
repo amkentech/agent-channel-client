@@ -24,6 +24,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { ADAPTERS, adapterFor, mergeHooks, which } from "../lib/adapters.mjs";
 import { readTok as readTokStore, saveTok as saveTokStore, tokFileHome, tokenEnvHint, refreshTokenEnv, CLIENT_HOME, IN_NPX_CACHE, HOME_STORE, RELOCATED } from "../lib/paths.mjs";
 import { readDiag, summarizeDiag } from "../lib/diag.mjs";
+import { cmpVersion, versionAt, clientRootsInHooks, UPDATE_CMD } from "../lib/client-version.mjs";
 import { summarizePushLog, configuredWs, wsHostPort, probe, probeLoadedThread, pushVerdict } from "../lib/codex-health.mjs";
 
 let REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -625,6 +626,22 @@ async function doctor() {
       try { execFileSync("schtasks", ["/Query", "/TN", WATCHDOG_TASK], { stdio: "pipe", windowsHide: true, timeout: 15000 }); installed = true; } catch {}
       if (installed) ok("listener watchdog scheduled task present (" + WATCHDOG_TASK + ")");
       else warn("listener watchdog not installed; a listener that dies mid-session stays dead until logon. Fix: npx @amkentech/agent-channel watchdog --install");
+    }
+  }
+  // Stale client copies (lib/client-version.mjs). Hooks run from whatever folder wire pointed them at, usually
+  // CLIENT_HOME; a copy older than the last release silently misses every hook fix since (0.8.0 vs 0.9.0, 2026-09-29).
+  {
+    let latest = null; try { latest = (await api("/status")).client_latest || null; } catch {}
+    const older = (v) => !!(latest && cmpVersion(v, latest) === -1);
+    const report = (what, v) => (older(v) ? bad : ok)(what + ": client " + (v || "unknown") + (older(v) ? ", older than " + latest + ". Update: " + UPDATE_CMD : latest ? " (latest " + latest + ")" : ""));
+    if (!latest) warn("server did not report the latest client version; client copies not compared");
+    if (existsSync(CLIENT_HOME)) report("installed copy " + CLIENT_HOME, versionAt(CLIENT_HOME));
+    const files = new Set();
+    for (const ad of Object.values(ADAPTERS)) {
+      if (!ad.hooksFile || files.has(ad.hooksFile)) continue;
+      files.add(ad.hooksFile);
+      let txt = ""; try { txt = readFileSync(ad.hooksFile, "utf8"); } catch { continue; }
+      for (const r of clientRootsInHooks(txt)) report(ad.label + " hooks run from " + r, versionAt(r));
     }
   }
   // A stored credential is checkable whether or not its CLI is. Gating every check on detect() made doctor
