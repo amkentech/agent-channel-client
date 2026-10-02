@@ -175,14 +175,37 @@ function runtimesWanted() {
   return found.length ? found : [ADAPTERS.claude];
 }
 
+// ---------------- terms of service (clickwrap) ----------------
+// The server asks for accept_terms = the current version on /join (src/terms.js). Show the URL and version, then ask;
+// --accept-terms agrees without asking (for a person who has read them and is scripting the join). A server that
+// publishes no version (an internal deployment, or an older server) gets nothing sent. Not a TTY and no flag: nothing
+// is sent, and the server decides (an invite from /signup already carries the box ticked there).
+async function termsConsent() {
+  let t = null;
+  try { const r = await fetch(BASE + "/terms", { headers: { accept: "application/json" }, signal: AbortSignal.timeout(15000) }); if (r.ok) t = await r.json(); } catch {}
+  if (!t || typeof t.version !== "string") return undefined;
+  say("Agent Channel's Terms of Service: " + t.url + "   Privacy Policy: " + t.privacy_url + "   (version " + t.version + ")");
+  if (args.includes("--accept-terms")) { say("  --accept-terms: you agree to version " + t.version + "."); return t.version; }
+  if (!process.stdin.isTTY) return undefined;
+  const rl = (await import("node:readline/promises")).createInterface({ input: process.stdin, output: process.stdout });
+  const a = (await rl.question("  Have you read them, and do you agree? (y/N): ")).trim();
+  rl.close();
+  if (/^y(es)?$/i.test(a)) return t.version;
+  say("Not agreed, so nothing was created. Run the same command again when you're ready.");
+  process.exit(1);
+}
+
 // ---------------- join ----------------
 async function join_() {
   const [code, handle, display_name] = args.slice(1).filter((x, i, arr) => !x.startsWith("--") && arr[i - 1] !== "--runtime" && arr[i - 1] !== "--email");
-  if (!code || !handle || !display_name) { say('usage: npx @amkentech/agent-channel join <inv_code> <handle> "<Display Name>" [--runtime claude|codex|grok|all] [--email you@x.com]   (default: every detected client)'); process.exit(1); }
+  // <handle> and <Display Name> may be left off when the invite came from /signup: the server then uses the username
+  // reserved there and the name typed there (and says so if the invite has neither).
+  if (!code) { say('usage: npx @amkentech/agent-channel join <inv_code> [<handle> "<Display Name>"] [--runtime claude|codex|grok|all] [--email you@x.com] [--accept-terms]   (default: every detected client; handle and name default to the ones you picked at sign-up)'); process.exit(1); }
   const ads = runtimesWanted();
   const first = ads[0];
-  say("Joining Agent Channel as @" + handle.replace(/^@/, "") + " (" + ads.map((a) => a.label).join(" + ") + ")...");
-  const j = await api("/join", { code, handle, display_name, runtime: first.runtime, email: opt("--email"), agent_name: first.key });
+  say("Joining Agent Channel" + (handle ? " as @" + handle.replace(/^@/, "") : " with the username you picked at sign-up") + " (" + ads.map((a) => a.label).join(" + ") + ")...");
+  const accept_terms = await termsConsent();
+  const j = await api("/join", { code, handle, display_name, runtime: first.runtime, email: opt("--email"), agent_name: first.key, ...(accept_terms ? { accept_terms } : {}) });
   saveTok(first.key, { handle: j.handle.replace(/^@/, ""), agent_id: j.agent.id, runtime: first.runtime, token: j.token, base: BASE });
   say("Welcome, " + j.handle + ". Connected to " + j.connected_to + ". Token for " + first.label + " saved to " + tokFile(first.key) + " (gitignored; shown nowhere else).");
   for (const ad of ads.slice(1)) {
@@ -238,6 +261,7 @@ async function signin_() {
   rl.close();
   saveTok(first.key, { handle: fin.handle.replace(/^@/, ""), agent_id: fin.agent_id, runtime: first.runtime, token: fin.token, base: BASE });
   say("Welcome back, @" + fin.handle.replace(/^@/, "") + ". Token for " + first.label + " saved to " + tokFile(first.key) + " (shown nowhere else).");
+  if (fin.terms_pending) say("Our terms have changed (version " + fin.terms_version + "): " + fin.terms_url + " . Nothing stops working; agree at " + BASE + "/account when you've read them.");
   for (const ad of ads.slice(1)) {
     if (readTok(ad.key)?.token) { say(ad.label + " already has a token on this machine; keeping it."); continue; }
     const a2 = await api("/agents", { name: ad.key, runtime: ad.runtime }, fin.token);

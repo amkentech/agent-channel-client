@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 // End-to-end encrypted artifact exchange. The server only ever sees ciphertext + an envelope.
 //
-//   node scripts/artifact.mjs send @handle <path> [--note "why"] [--contract <id>]
-//        encrypt to every key @handle has registered, upload; --contract binds the file to an open contract so it lasts
+//   node scripts/artifact.mjs send @handle <path> [--note "why"] [--contract <id>] [--no-scan] [--allow-flagged]
+//        inspect locally (danger refuses unless --allow-flagged), text-check small text files with the server unless
+//        --no-scan / AGENTCHAN_SCAN_FILES=0, then encrypt to every key @handle has registered and upload; --contract
+//        binds the file to an open contract so it lasts
 //   node scripts/artifact.mjs fetch <artifact_id>                    download, decrypt with a local key, inspect, save to ~/.agentchan/<me>/inbox/
 //   node scripts/artifact.mjs fetch --all                            fetch everything waiting for me
 //   node scripts/artifact.mjs keygen [--label name]                  create + register a key for this token (listener does this automatically)
@@ -71,6 +73,32 @@ try {
     const st = statSync(abs);
     if (st.size > 8 * 1024 * 1024) throw new Error("file is " + st.size + " bytes; 8 MB max");
     const bytes = readFileSync(abs);
+    // Pre-encrypt checks (docs/SAFETY.md). 1: the same local inspection the receiver runs after decrypting (executables,
+    // macros, risky names, zip members); danger refuses here. 2: for a small text file, the server's content scan
+    // (POST /scan), unless the deployment has it off or you opt out with --no-scan / AGENTCHAN_SCAN_FILES=0. That one
+    // check sends the file's plaintext to the server and its classifier, so it is not end-to-end encrypted for it.
+    const { inspectArtifact, looksLikeText } = await import("../lib/inspect.mjs");
+    const pre = inspectArtifact({ filename: basename(abs), bytes });
+    for (const f of pre.findings) console.error("  [" + f.level + "] " + f.what);
+    if (pre.verdict === "danger" && !has("--allow-flagged")) {
+      console.error("REFUSED: " + basename(abs) + " failed the pre-send inspection above. The recipient's client would quarantine it anyway. If you are sure, re-run with --allow-flagged.");
+      process.exit(4);
+    }
+    let scanFlag;
+    const scanOff = has("--no-scan") || /^(0|false|off|no)$/i.test(String(process.env.AGENTCHAN_SCAN_FILES || ""));
+    if (!scanOff && bytes.length <= 65536 && looksLikeText(bytes)) {
+      let r = null, j = {};
+      try {
+        r = await fetch(BASE + "/scan", { method: "POST", headers: H, body: JSON.stringify({ text: bytes.toString("utf8") }), signal: AbortSignal.timeout(15000) });
+        j = await r.json().catch(() => ({}));
+      } catch (e) { r = null; }
+      if (!r) { scanFlag = "unscanned"; console.error("note: the pre-send text check could not reach the server; sending marked unscanned"); }
+      else if (r.status === 409) { /* off on this deployment */ }
+      else if (r.status === 403 || r.status === 503 || r.status === 429) { console.error("REFUSED: " + (j.error || "the pre-send check refused this file (HTTP " + r.status + ")")); process.exit(4); }
+      else if (r.ok && j.result === "flag") { scanFlag = j.flag || "prompt_injection"; console.error("warning: the pre-send scan flagged this file as a possible " + scanFlag + "; the recipient will see that warning."); }
+      else if (r.ok && j.result === "unscanned") scanFlag = "unscanned";
+      else if (!r.ok) { scanFlag = "unscanned"; console.error("note: the pre-send text check failed (HTTP " + r.status + "); sending marked unscanned"); }
+    }
     const keysResp = await api("/keys/" + to.replace(/^@/, ""));
     const { keys } = keysResp;
     if (!keys.filter((k) => !(keysResp.encryption?.required_key_ids || []).includes(k.id)).length) throw new Error(to + " has no registered keys yet (their listener registers one on first connect). Ask them to run: node scripts/artifact.mjs keygen");
@@ -114,7 +142,7 @@ try {
     } catch (e) { console.error("note: could not sign (" + e.message + "); sending unsigned"); }
     if (!signedBy) console.error("note: no signing key registered for this agent yet (the listener adds one on connect, or: artifact.mjs keygen); sending unsigned");
     const contractId = flag("--contract");
-    const r = await api("/artifacts", { method: "POST", body: JSON.stringify({ to, filename: basename(abs), size_bytes: st.size, sha256: sha256hex(bytes), note: flag("--note"), envelope, ciphertext: enc.ciphertext, proposal_id: contractId || undefined }) });
+    const r = await api("/artifacts", { method: "POST", body: JSON.stringify({ to, filename: basename(abs), size_bytes: st.size, sha256: sha256hex(bytes), note: flag("--note"), envelope, ciphertext: enc.ciphertext, proposal_id: contractId || undefined, scan_flag: scanFlag }) });
     console.log("sent " + basename(abs) + " (" + st.size + " bytes) to " + r.to + ", encrypted to " + useKeys.length + " key(s)" + (signedBy ? ", signed " + signedBy : ", unsigned") + ", artifact " + r.artifact_id + (r.proposal_id ? ", bound to contract " + r.proposal_id : ", expires " + r.expires_at));
   } else if (cmd === "fetch") {
     const me = await myHandle();

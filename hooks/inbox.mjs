@@ -291,7 +291,7 @@ const renderable = (p) => !!p && (
   ((p.unread_messages || 0) + (p.proposals_awaiting_you || 0) + (p.artifacts_waiting || 0)) > 0
   || (p.items || []).length > 0
   || (p.summary || []).length > 0
-  || (p.handoffs_for_other_runtimes || []).some((h) => h.status === "stale"));
+  || [...(p.handoffs_for_other_runtimes || []), ...(p.handoffs_you_sent || [])].some((h) => h.status === "stale"));
 if (!verified && renderable(peek)) {
   const fresh = await fetchPeek();
   if (fresh) { peek = fresh; verified = true; serverTruth = true; }
@@ -420,9 +420,14 @@ const repeats = [...humansAll, ...handsAll].filter((i) => !firstTime.has(i.id));
 // The age is deliberately NOT in this text: the marker is keyed on the line, so a line that changes every
 // prompt would never be recognised as already-shown and would re-nag forever - the exact bug this file exists
 // to fix. The age and the expiry countdown are in my_inbox, which is where the line points.
-const staleLines = (p) => (p?.handoffs_for_other_runtimes || [])
-  .filter((h) => h.status === "stale")
-  .map((h) => "handoff for " + (h.for_runtime || "another runtime") + " has not been taken up, though that runtime has been online since; my_inbox has it (and how long)");
+// What THIS session sent itself arrives separately (peek.handoffs_you_sent, 2026-10-01) and is worded as outgoing
+// status: before, the server listed it as a sibling's mail and this line read as if someone else's work were rotting.
+const staleLines = (p) => [
+  ...(p?.handoffs_for_other_runtimes || []).filter((h) => h.status === "stale")
+    .map((h) => "handoff for " + (h.for_runtime || "another runtime") + " has not been taken up, though that runtime has been online since; my_inbox has it (and how long)"),
+  ...(p?.handoffs_you_sent || []).filter((h) => h.status === "stale")
+    .map((h) => "you sent: handoff to " + (h.for_runtime || "another runtime") + " (outgoing) not taken up yet, though that runtime has been online since; my_inbox lists it under handoffs_you_sent"),
+];
 const staleHandoffs = staleLines(peek);
 for (const l of staleLines(peekAll)) allLiveLines.add(l);
 const others = [...staleHandoffs, ...(peek?.summary || [])].filter((s) => !humansAll.some((h) => s.startsWith(h.from + ":") || s.startsWith(h.from + " (")) && !(s.startsWith("HANDOFF") && s.includes("(THIS session)")));

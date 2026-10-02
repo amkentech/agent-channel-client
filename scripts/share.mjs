@@ -5,6 +5,7 @@
 //   node scripts/share.mjs <path> [--expires 72h|3d] [--views N] [--runtime claude|codex]
 //   node scripts/share.mjs --conversation [--last N] [--full] [--expires 72h] [--views N]
 //   node scripts/share.mjs --list | --revoke <id>
+//   With no account yet, the first share asks you to agree to the Terms of Service (or pass --accept-terms).
 import { readFileSync, statSync } from "node:fs";
 import { basename, extname, resolve, dirname } from "node:path";
 import { webcrypto as wc } from "node:crypto";
@@ -21,7 +22,22 @@ if (!token) {
   // No invite needed to share: mint an anonymous sender token (links only) and keep it for next time. `join` replaces it.
   const { saveTok } = await import("../lib/paths.mjs");
   try {
-    const r = await fetch(BASE + "/anon", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ runtime }), signal: AbortSignal.timeout(15000) });
+    // Clickwrap (server src/terms.js): show the terms URL and version and ask, or take --accept-terms. A server that
+    // publishes no version sends nothing and the server decides.
+    let accept_terms;
+    let t = null;
+    try { const tr = await fetch(BASE + "/terms", { headers: { accept: "application/json" }, signal: AbortSignal.timeout(15000) }); if (tr.ok) t = await tr.json(); } catch {}
+    if (t && typeof t.version === "string") {
+      console.error("Agent Channel's Terms of Service: " + t.url + "   Privacy Policy: " + t.privacy_url + "   (version " + t.version + ")");
+      if (has("--accept-terms")) accept_terms = t.version;
+      else if (process.stdin.isTTY) {
+        const rl = (await import("node:readline/promises")).createInterface({ input: process.stdin, output: process.stderr });
+        const a = (await rl.question("Have you read them, and do you agree? (y/N): ")).trim(); rl.close();
+        if (!/^y(es)?$/i.test(a)) { console.error("Not agreed, so no share token was created."); process.exit(1); }
+        accept_terms = t.version;
+      } else { console.error("To share without an account, agree to the terms: rerun with --accept-terms once you've read them."); process.exit(1); }
+    }
+    const r = await fetch(BASE + "/anon", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ runtime, ...(accept_terms ? { accept_terms } : {}) }), signal: AbortSignal.timeout(15000) });
     const j = await r.json().catch(() => ({}));
     if (!r.ok || !j.token) throw new Error(j.error || ("HTTP " + r.status));
     token = j.token;

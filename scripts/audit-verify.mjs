@@ -7,6 +7,8 @@
 //   node scripts/audit-verify.mjs --declaration <file|url>           GET /declarations/<id>.json (signature, digest)
 //   node scripts/audit-verify.mjs --anchors <file|url> [--tsa-root pem] [--rekor-key pem] [--export export.json]
 //                                                                    GET /ledger/anchors: RFC 3161 tokens + Rekor entries, offline
+//   node scripts/audit-verify.mjs --play export.json                 play_trail mode=export: the PLAY chain (duels, quests)
+//   node scripts/audit-verify.mjs --anchors <file|url> --play        GET /ledger/anchors?chain=play
 //   options: --pubkey|--public-key <pem file> | --pubkey-url <url> (default: the server named in the export), --no-sig (skip signature)
 // Checks: every ledger row's hash from its canonical string, every visible chain link, and (if present) the server's Ed25519
 // signature over the sha256 of the canonical JSON body, against a public key you supply or fetch. Pin the key out of band
@@ -17,7 +19,11 @@ import { createHash, createPublicKey, verify as edVerify } from "node:crypto";
 const args = process.argv.slice(2);
 const opt = (k) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] : null; };
 const file = args.find((a, i) => !a.startsWith("--") && !["--pubkey", "--pubkey-url", "--public-key", "--server", "--tsa-root", "--rekor-key", "--export"].includes(args[i - 1]));
-if (!file) { console.error("usage: audit-verify.mjs [--record|--disclosure|--receipt|--declaration|--anchors] <file.json|url> [--pubkey file.pem | --public-key file.pem | --pubkey-url url | --no-sig]\n       audit-verify.mjs --anchors <anchors.json|https://server/ledger/anchors> [--tsa-root root.pem ...] [--rekor-key key.pem ...] [--export audit-export.json]"); process.exit(1); }
+// Two chains share one canonical form (src/audit.js canonical): `audit`, the authorization record, and `play`, duels and
+// quests (src/play.js). --play says which one this file must be, so a play export can never pass as authorization
+// evidence and an audit export can never be read as a game record.
+const PLAY = args.includes("--play");
+if (!file) { console.error("usage: audit-verify.mjs [--record|--disclosure|--receipt|--declaration|--anchors] [--play] <file.json|url> [--pubkey file.pem | --public-key file.pem | --pubkey-url url | --no-sig]\n       audit-verify.mjs --anchors <anchors.json|https://server/ledger/anchors> [--tsa-root root.pem ...] [--rekor-key key.pem ...] [--export audit-export.json]"); process.exit(1); }
 
 // ---- external anchors (GET /ledger/anchors; docs/VERIFY.md "External anchors") ----
 // Offline except for fetching the listing when given a URL. Every RFC 3161 token: messageImprint == the anchored head
@@ -35,17 +41,24 @@ if (args.includes("--anchors")) {
   console.log("pinned TSA roots: " + roots.tsa.map((r) => r.name).join("; "));
   console.log("pinned Rekor keys: " + roots.rekor.map((r) => r.name).join("; "));
   let anchors = [], listing;
+  const want = PLAY ? "play" : "audit";
+  let src = file;
+  if (/^https?:\/\//i.test(file) && PLAY) { const u = new URL(file); if (!u.searchParams.get("chain")) u.searchParams.set("chain", "play"); src = u.toString(); }
   try {
-    listing = await rv.loadJson(file);
+    listing = await rv.loadJson(src);
     anchors.push(...(listing.anchors || []));
     // a URL listing pages by after_id; follow it (bounded)
-    for (let p = 0; /^https?:\/\//i.test(file) && listing.next_after_id && p < 100; p++) {
-      const u = new URL(file); u.searchParams.set("after_id", listing.next_after_id);
+    for (let p = 0; /^https?:\/\//i.test(src) && listing.next_after_id && p < 100; p++) {
+      const u = new URL(src); u.searchParams.set("after_id", listing.next_after_id);
       listing = await rv.loadJson(u.toString());
       anchors.push(...(listing.anchors || []));
     }
   } catch (e) { console.error("cannot read " + file + ": " + e.message); process.exit(1); }
-  if (!anchors.length) { console.log("no anchors in this listing"); process.exit(1); }
+  // an anchor row with no chain predates the play chain: it is an audit anchor
+  const other = anchors.filter((a) => (a.chain || "audit") !== want).length;
+  anchors = anchors.filter((a) => (a.chain || "audit") === want);
+  console.log("chain: " + want + (other ? " (" + other + " anchor(s) for another chain ignored)" : ""));
+  if (!anchors.length) { console.log("no " + want + "-chain anchors in this listing"); process.exit(1); }
   let rowsBySeq = null;
   if (opt("--export")) {
     let ex = JSON.parse(readFileSync(opt("--export"), "utf8"));
@@ -57,7 +70,7 @@ if (args.includes("--anchors")) {
   let bad = 0;
   const good = [];
   for (const a of anchors.sort((x, y) => Number(x.head_seq) - Number(y.head_seq) || Number(x.id) - Number(y.id))) {
-    const r = av.verifyAnchor({ kind: a.kind, head_hash: a.head_hash, proof: a.proof }, roots);
+    const r = await av.verifyAnchor({ kind: a.kind, head_hash: a.head_hash, proof: a.proof }, roots);
     const who = a.kind === "rfc3161" ? (r.tsa || a.proof?.tsa || a.anchor_name) + " (RFC 3161)" : "Rekor " + (a.endpoint || "") + " logIndex " + (r.logIndex ?? a.proof?.entry?.logIndex);
     const when = a.kind === "rfc3161" ? r.genTime : r.integratedTime;
     let tie = "";
@@ -166,6 +179,10 @@ if (doc.record && doc.digest_sha256 === undefined && doc.signature) doc = { body
 const wrapped = doc.body ? doc : null;            // signed wrapper { body, digest_sha256, signature }
 const body = wrapped ? wrapped.body : doc;
 let problems = 0;
+const isPlay = body.format === "agentchan-play-export-v1" || body.chain === "play";
+if (PLAY && !isPlay) { console.error("--play: this is not a play-chain export (format " + JSON.stringify(body.format ?? null) + "); play_trail mode=export produces one"); process.exit(1); }
+if (!PLAY && isPlay) console.log("note: this is a PLAY-chain export (duels, quests), not the authorization record; pass --play to assert that");
+console.log("chain: " + (isPlay ? "play" : "audit"));
 
 // ---- 1. ledger rows (audit export: body.entries; contract record: body.timeline has hash+prev_hash but no canonical) ----
 const canonJson = (v) => v === null || v === undefined || typeof v !== "object" ? JSON.stringify(v === undefined ? null : v) : v instanceof Date ? JSON.stringify(v.toISOString()) : Array.isArray(v) ? "[" + v.map((x) => (x === undefined ? "null" : canonJson(x))).join(",") + "]" : "{" + Object.keys(v).filter((k) => v[k] !== undefined).sort().map((k) => JSON.stringify(k) + ":" + canonJson(v[k])).join(",") + "}";
